@@ -1,0 +1,55 @@
+[package]
+name = "price-quoter"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "Real-Time Price Quoter using Tycho"
+
+[features]
+default = []
+cli = ["dep:clap", "dep:rustyline", "dep:reqwest"]
+api = ["dep:axum", "dep:tokio", "dep:hyper"]
+delta_sssp = []
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"], optional = true }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+indexmap = "2.2"
+petgraph = "0.6"
+futures = "0.3"
+async-stream = "0.3"
+num-traits = "0.2"
+hex = "0.4"
+rust_decimal = { version = "1.35" }
+lru = "0.12"
+good_lp = "1.6.0"
+itertools = "0.12"
+chrono = "0.4.40"
+rayon = "1.8"
+toml = "0.7"
+num-bigint = "0.4.6"
+tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation.git", rev = "2ef64b9bcc20de865303efceb3a5d245c34b32c0" }
+
+# Optional deps for features
+clap = { version = "4.4", features = ["derive"], optional = true }
+axum = { version = "0.7", features = ["json"], optional = true }
+hyper = { version = "1.4", features = ["full"], optional = true }
+hyper-util = { version = "0.1", features = ["full"], optional = true }
+rustyline = { version = "13", optional = true }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], optional = true }
+slotmap = "1.0"
+# Use the alloy-primitives version from tycho-simulation to avoid duplicate crate versions
+# alloy-primitives is already a transitive dependency; no explicit version required here
+
+# Align with tycho-simulation's alloy-primitives version to ensure type compatibility
+alloy-primitives = { version = "0.8.9", default-features = false }
+
+[lib]
+name = "price_quoter"
+path = "src/lib.rs" 
