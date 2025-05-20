@@ -129,6 +129,8 @@ pub struct SinglePathQuote {
     pub input_amount: Option<u128>,
     pub node_path: Vec<NodeIndex>,
     pub edge_seq: Vec<EdgeIndex>,
+    pub gas_cost_native: Option<Decimal>, // Added
+    pub gas_cost_in_token_out: Option<Decimal>, // Added
 }
 
 // Placeholder for PriceEngine methods that will be moved or called from here
@@ -150,6 +152,8 @@ pub fn invalid_path_quote(path: &[NodeIndex], edge_seq: &[EdgeIndex], amount_in:
         input_amount: Some(amount_in),
         node_path: path.to_vec(),
         edge_seq: edge_seq.to_vec(),
+        gas_cost_native: None,
+        gas_cost_in_token_out: None,
     }
 }
 
@@ -277,197 +281,219 @@ pub fn generate_quote_with_gas(
 // Ideally, this would be in its own module.
 
 use crate::data_management::cache::{QuoteCache, CachedContinuousPrice};
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
-use tokio::time::{interval, Duration};
+use crate::data_management::component_tracker::ComponentTracker;
+use crate::engine::PriceEngine; // Assuming PriceEngine is in crate::engine
+use std::sync::{Arc, RwLock, Mutex};
+use tokio_stream::StreamExt; // For updates.next().await
 use tracing::{info, error, warn};
-use std::fs::File;
-use std::io::{BufReader, BufRead};
+use rust_decimal::Decimal;
+use std::fs::{File, OpenOptions};
+use std::io::{Write, BufReader, BufRead};
+use std::collections::HashSet;
 
 
 // Represents the information needed to price a token against the chosen numeraire
-struct TrackedTokenPriceRequest {
-    token_to_price: Bytes,
-    numeraire_token: Bytes,
-    probe_amount_for_numeraire: f64,
-}
+// struct TrackedTokenPriceRequest { // This struct seems unused now
+//     token_to_price: Bytes,
+//     numeraire_token: Bytes,
+//     probe_amount_for_numeraire: f64,
+// }
 
 pub struct ContinuousPriceUpdater {
     config: Arc<AppConfig>,
-    // The QuoteCache needs to be Arc<RwLock<>> because the updater runs in a separate async task
-    // and will mutate it, while other parts of the application might read it.
     price_cache: Arc<RwLock<QuoteCache>>,
-    tracked_tokens: Arc<RwLock<HashSet<Bytes>>>,
+    price_engine: Arc<PriceEngine>, 
+    tracker: Arc<ComponentTracker>,   
     global_numeraire: Bytes,
-    // tycho_listener: TychoListener, // Placeholder for actual Tycho integration
-    current_block: Arc<RwLock<u64>>, // To associate prices with a block number
+    tokens_for_history: HashSet<Bytes>,
+    price_history_writer: Option<Arc<Mutex<csv::Writer<File>>>>,
 }
 
 impl ContinuousPriceUpdater {
-    pub fn new(config: Arc<AppConfig>, price_cache: Arc<RwLock<QuoteCache>>) -> PriceQuoterResult<Self> {
-        let global_numeraire = config.numeraire_token.clone()
-            .ok_or_else(|| PriceQuoterError::ConfigError("Global numeraire_token must be configured for ContinuousPriceUpdater.".to_string()))?;
+    pub fn new(
+        config: Arc<AppConfig>,
+        price_cache: Arc<RwLock<QuoteCache>>,
+        price_engine: Arc<PriceEngine>,
+        tracker: Arc<ComponentTracker>,
+    ) -> PriceQuoterResult<Self> {
+        let global_numeraire = config.numeraire_token.clone().ok_or_else(|| {
+            PriceQuoterError::ConfigError(
+                "Global numeraire_token must be configured for ContinuousPriceUpdater.".to_string(),
+            )
+        })?;
 
-        let mut initial_tracked_tokens = HashSet::new();
+        let mut tokens_for_history = HashSet::new();
         if let Some(tokens_file_path) = &config.tokens_file {
-            info!("Loading initial tracked tokens from: {}", tokens_file_path);
+            info!("Loading tokens for price history from: {}", tokens_file_path);
             match File::open(tokens_file_path) {
                 Ok(file) => {
                     let reader = BufReader::new(file);
                     for line in reader.lines() {
                         match line {
                             Ok(addr_str) => {
-                                if addr_str.starts_with("#") || addr_str.trim().is_empty() { continue; }
+                                if addr_str.starts_with('#') || addr_str.trim().is_empty() { continue; }
                                 match Bytes::from_str(addr_str.trim()) {
                                     Ok(token_bytes) => {
-                                        initial_tracked_tokens.insert(token_bytes);
+                                        tokens_for_history.insert(token_bytes);
                                     }
                                     Err(e) => {
-                                        warn!("Failed to parse token address '{}' from tokens file: {}", addr_str, e);
+                                        warn!("Failed to parse token address '{}' from tokens file for history: {}", addr_str, e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to read line from tokens file: {}", e);
+                                warn!("Failed to read line from tokens file for history: {}", e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to open tokens_file '{}': {}. No initial tokens loaded.", tokens_file_path, e);
+                    warn!("Failed to open tokens_file '{}' for history: {}. No specific tokens will be tracked for history.", tokens_file_path, e);
                 }
             }
         }
-        if initial_tracked_tokens.is_empty() {
-            info!("No initial tokens loaded for continuous tracking. Add tokens via API or tokens_file.");
-        }
 
+        let price_history_writer = if let Some(history_file_path) = &config.price_history_file {
+            let is_new_file = !std::path::Path::new(history_file_path).exists();
+            match OpenOptions::new().append(true).create(true).open(history_file_path) {
+                Ok(file) => {
+                    let mut writer = csv::Writer::from_writer(file);
+                    if is_new_file {
+                        info!("Price history file {} created. Writing header.", history_file_path);
+                        if let Err(e) = writer.write_record(&["block_number", "token_address", "price", "numeraire_address"]) {
+                            error!("Failed to write header to price history file {}: {}", history_file_path, e);
+                            None // Disable writer if header fails
+                        } else {
+                            if let Err(e) = writer.flush() {
+                                error!("Failed to flush header to price history file {}: {}", history_file_path, e);
+                            }
+                            Some(Arc::new(Mutex::new(writer)))
+                        }
+                    } else {
+                        info!("Appending to existing price history file: {}", history_file_path);
+                        Some(Arc::new(Mutex::new(writer)))
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to open or create price history file {}: {}. Price history will be disabled.", history_file_path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if price_history_writer.is_some() {
+            if config.tokens_file.is_some() {
+                info!("Price history enabled. Logging specific tokens from: {:?}. Total: {}", config.tokens_file.as_ref().unwrap(), tokens_for_history.len());
+            } else {
+                info!("Price history enabled. Logging all calculated token prices to: {:?}", config.price_history_file.as_ref().unwrap());
+            }
+        } else {
+            info!("Price history saving is disabled.");
+        }
+        
         Ok(Self {
-            config,
+            config: config.clone(), // Clone config for ownership if needed later, or ensure all uses are through Arc
             price_cache,
-            tracked_tokens: Arc::new(RwLock::new(initial_tracked_tokens)),
+            price_engine,
+            tracker,
             global_numeraire,
-            current_block: Arc::new(RwLock::new(0)), // Initialize block number
+            tokens_for_history,
+            price_history_writer,
         })
     }
 
     // Main loop for the updater
     pub async fn run(&self) {
-        info!("ContinuousPriceUpdater started. Numeraire: {:?}", self.global_numeraire);
-        // TODO: Replace interval with actual Tycho block event listener
-        // For now, simulate block ticks and increment block number
+        info!(
+            "ContinuousPriceUpdater started. Numeraire: {:?}, Tycho URL: {:?}",
+            self.global_numeraire, self.config.tycho_rpc_url
+        );
 
-        // Determine block time based on the chain
-        let block_time_duration = match self.config.chain {
-            // Assuming tycho_simulation::tycho_common::models::Chain is the type of self.config.chain
-            // And assuming variants like Ethereum, Base. Add other chains as needed.
-            // tycho_simulation::tycho_common::models::Chain::Ethereum => Duration::from_secs(12),
-            // tycho_simulation::tycho_common::models::Chain::Base => Duration::from_secs(2),
-            // tycho_simulation::tycho_common::models::Chain::Arbitrum => Duration::from_millis(250),
-            _ => Duration::from_secs(12), // Default block time if chain not matched or variants unknown
-        };
-        info!("Using block time duration for updates: {:?}", block_time_duration);
-        let mut tick_interval = interval(block_time_duration);
+        let tycho_url = self.config.tycho_rpc_url.clone().unwrap_or_default();
+        let tycho_api_key = self.config.tycho_api_key.clone();
 
-        loop {
-            tick_interval.tick().await; // Wait for new block/tick
-            
-            let mut current_block_guard = self.current_block.write().unwrap();
-            *current_block_guard += 1; // Increment block number
-            let block_for_this_update = *current_block_guard;
-            drop(current_block_guard);
+        // Create the Tycho update stream
+        // stream_updates takes &self, so tracker needs to be Arc'd or PriceUpdater needs to own it.
+        // Assuming tracker is Arc<ComponentTracker> as passed in new()
+        let mut updates = self.tracker.stream_updates(
+            tycho_url,
+            self.config.chain.clone(), // Assuming AppConfig.chain is suitable
+            tycho_api_key,
+            Some(self.config.tvl_update_threshold_usd.unwrap_or(1000.0) as u64), // Example threshold
+        );
 
-            info!("Updating prices for block: {}", block_for_this_update);
+        info!("Tycho update stream initiated.");
 
-            let tokens_to_update = self.get_tokens_to_update();
-            if tokens_to_update.is_empty() {
-                info!("No tokens currently tracked for continuous price updates.");
-                continue;
-            }
-            
-            // Use probe_depth from config for the amount_in of the numeraire token
-            // Default to 1.0 unit of numeraire if probe_depth is not set or zero
-            let probe_amount = self.config.probe_depth.map_or(1.0, |d| if d == 0 { 1.0 } else { d as f64 });
+        while let Some(block_update_result) = updates.next().await {
+            match block_update_result {
+                Ok(block_data) => {
+                    let block_for_this_update = block_data.block_number;
+                    info!("Received block update for block: {}", block_for_this_update);
 
-            for token_addr in tokens_to_update {
-                if token_addr == self.global_numeraire {
-                    // Price of numeraire in itself is 1, handle explicitly or skip
-                    // For now, let's construct a simple QuoteResult for it.
-                    let numeraire_price = QuoteResult {
-                        amount_out_gross: 1.0,
-                        path: vec![self.global_numeraire.clone(), self.global_numeraire.clone()],
-                        total_fee: 0.0,
-                        estimated_slippage: Some(0.0),
-                        gas_cost_native: Some(0.0),
-                        gas_cost_token_out: Some(0.0),
-                        amount_out_net: 1.0,
+                    self.price_engine.update_graph_from_tracker_state();
+                    info!("PriceEngine graph updated for block: {}", block_for_this_update);
+                    
+                    let tokens_to_update = match self.price_engine.graph.read() { // Renamed for clarity
+                        Ok(graph_guard) => graph_guard.get_all_token_addresses(),
+                        Err(e) => {
+                            error!("Failed to get read lock on graph: {}. Skipping update for block {}", e, block_for_this_update); // Corrected variable name
+                            continue;
+                        }
                     };
-                    let cached_price = CachedContinuousPrice::from((numeraire_price, block_for_this_update));
-                    self.price_cache.write().unwrap().update_continuous_price(token_addr.clone(), cached_price);
-                    info!("Updated price for numeraire token {} (self-price): 1.0", token_addr);
-                    continue;
+
+                    if tokens_to_update.is_empty() {
+                        info!("No tokens found in the graph to update for block {}.", block_for_this_update);
+                        continue;
+                    }
+                    info!("Found {} tokens in graph to update prices for block {}.", tokens_to_update.len(), block_for_this_update);
+
+                    for token_addr in tokens_to_update {
+                        let price_option: Option<Decimal>;
+                        if token_addr == self.global_numeraire {
+                            price_option = Some(Decimal::ONE);
+                            // info!("Price for numeraire token {} (self-price) is 1.0", token_addr);
+                        } else {
+                            // PriceEngine's get_token_price uses its configured numeraire and probe depth
+                            price_option = self.price_engine.get_token_price(&token_addr, Some(block_for_this_update));
+                            // match price_option {
+                            //     Some(price) => info!("Calculated price for token {}: {} (vs numeraire {}) at block {}", token_addr, price, self.global_numeraire, block_for_this_update),
+                            //     None => warn!("Could not calculate price for token {} at block {}", token_addr, block_for_this_update),
+                            // }
+                        }
+
+                        let cached_price = CachedContinuousPrice {
+                            price: price_option,
+                            block: block_for_this_update,
+                        };
+                        
+                        match self.price_cache.write() {
+                            Ok(mut cache_guard) => {
+                                cache_guard.update_continuous_price(token_addr.clone(), cached_price.clone());
+                                if price_option.is_some() {
+                                   // info!("Updated price for token {}: {} at block {}", token_addr, price_option.unwrap(), block_for_this_update);
+                                } else {
+                                   // warn!("Stored None price for token {} at block {}", token_addr, block_for_this_update);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to get write lock on price_cache for token {}: {}. Skipping cache update.", token_addr, e);
+                            }
+                        }
+                    }
+                    info!("Finished price updates for block: {}", block_for_this_update);
                 }
-
-                let request = QuoteRequest {
-                    from_token: self.global_numeraire.clone(), // Price from Global Numeraire
-                    to_token: token_addr.clone(),             // To the Token we are tracking
-                    amount_in: probe_amount,                  // Probe with a standard amount of the numeraire
-                    max_hops: self.config.max_hops,           // Use configured max_hops
-                };
-
-                match generate_quote_with_gas(&request, &self.config) {
-                    Ok(quote_result) => {
-                        let cached_price = CachedContinuousPrice::from((quote_result, block_for_this_update));
-                        // Lock cache for write
-                        let mut cache_guard = self.price_cache.write().unwrap();
-                        cache_guard.update_continuous_price(token_addr.clone(), cached_price);
-                        drop(cache_guard);
-                        // info!("Updated price for token {}: Net Amount {:.6}", token_addr, cached_price.amount_out_net);
-                    }
-                    Err(e) => {
-                        error!("Failed to update price for token {}: {}", token_addr, e);
-                    }
+                Err(e) => {
+                    error!("Error receiving block update from Tycho stream: {}", e);
+                    // Depending on the error, might need to decide whether to break or continue
                 }
             }
-            info!("Finished price updates for block: {}", block_for_this_update);
         }
+        warn!("Tycho update stream ended.");
     }
 
-    fn get_tokens_to_update(&self) -> Vec<Bytes> {
-        // For now, returns all tracked tokens. 
-        // TODO: Could be enhanced to select tokens based on recent Tycho updates if available.
-        let tracked_tokens_guard = self.tracked_tokens.read().unwrap();
-        let tokens: Vec<Bytes> = tracked_tokens_guard.iter().cloned().collect();
-        drop(tracked_tokens_guard);
-        tokens
-    }
-
-    pub fn add_tracked_token(&self, token: Bytes) {
-        let mut tracked_tokens_guard = self.tracked_tokens.write().unwrap();
-        if tracked_tokens_guard.insert(token.clone()) {
-            info!("Added token to continuous tracking: {}", token);
-        } else {
-            info!("Token {} is already being tracked.", token);
-        }
-    }
-
-    pub fn remove_tracked_token(&self, token: &Bytes) {
-        let mut tracked_tokens_guard = self.tracked_tokens.write().unwrap();
-        if tracked_tokens_guard.remove(token) {
-            info!("Removed token from continuous tracking: {}", token);
-            // Also remove it from the continuous price cache explicitly
-            self.price_cache.write().unwrap().continuous_prices.pop(token);
-        } else {
-            info!("Token {} was not in the tracking list.", token);
-        }
-    }
-    
-    pub fn list_tracked_tokens(&self) -> Vec<Bytes> {
-        self.tracked_tokens.read().unwrap().iter().cloned().collect()
-    }
-
-    // Method to get the current block number used by the updater
-    pub fn get_current_block(&self) -> u64 {
-        *self.current_block.read().unwrap()
-    }
-} 
+    // get_tokens_to_update, add_tracked_token, remove_tracked_token, list_tracked_tokens
+    // are now obsolete as we price all tokens from the graph.
+    // get_current_block is also obsolete as block number comes from Tycho.
+}

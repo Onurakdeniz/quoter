@@ -12,6 +12,7 @@ pub mod utils;
 
 pub mod engine;
 pub mod data_management;
+pub mod bindings;
 
 // #[cfg(feature = "api")]
 // pub mod api;  

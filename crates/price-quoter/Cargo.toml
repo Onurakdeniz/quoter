@@ -12,7 +12,7 @@ api = ["dep:axum", "dep:hyper"]
 delta_sssp = []
 
 [dependencies]
-tokio = { version = "1", features = ["time", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["full"] } # Ensure "full" features
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -26,7 +26,7 @@ futures = "0.3"
 async-stream = "0.3"
 num-traits = "0.2"
 hex = "0.4"
-rust_decimal = { version = "1.35" }
+rust_decimal = { version = "1.35", features = ["pyo3"] } # Add "pyo3" feature
 lru = "0.12"
 good_lp = "1.6.0"
 itertools = "0.12"
@@ -35,6 +35,9 @@ rayon = "1.8"
 toml = "0.7"
 num-bigint = "0.4.6"
 tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation.git", rev = "2ef64b9bcc20de865303efceb3a5d245c34b32c0" }
+pyo3 = { version = "0.20.0", features = ["extension-module", "abi3-py37"] }
+pyo3-asyncio = { version = "0.20.0", features = ["tokio-runtime"] }
+
 
 # Optional deps for features
 clap = { version = "4.4", features = ["derive"], optional = true }
@@ -49,7 +52,9 @@ slotmap = "1.0"
 
 # Align with tycho-simulation's alloy-primitives version to ensure type compatibility
 alloy-primitives = { version = "0.8.9", default-features = false }
+csv = "1.1"
 
 [lib]
 name = "price_quoter"
-path = "src/lib.rs" 
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]

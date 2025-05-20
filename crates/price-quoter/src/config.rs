@@ -28,6 +28,7 @@ pub struct AppConfig {
     pub buy_token_address: Option<String>,
     pub sell_amount_value: Option<f64>,
     pub display_numeraire_token_address: Option<String>,
+    pub price_history_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +89,8 @@ pub struct CliConfig {
     pub sell_amount: Option<f64>,
     #[arg(long)]
     pub display_numeraire_token: Option<String>,
+    #[arg(long)]
+    pub price_history_file: Option<String>,
 }
 
 impl AppConfig {
@@ -135,6 +138,7 @@ impl AppConfig {
             buy_token_address: None,
             sell_amount_value: None,
             display_numeraire_token_address: None,
+            price_history_file: env::var("PRICE_HISTORY_FILE").ok(),
         }
     }
 
@@ -158,6 +162,7 @@ impl AppConfig {
             sell_amount_value: None,
             display_numeraire_token_address: None,
             native_token_address: None,
+            price_history_file: None,
         };
         if let Some(ref path) = cli.config {
             if let Ok(contents) = std::fs::read_to_string(path) {
@@ -228,6 +233,9 @@ impl AppConfig {
         let display_numeraire_token_address = cli.display_numeraire_token
             .or(file_config.display_numeraire_token_address)
             .or(env::var("DISPLAY_NUMERAIRE_TOKEN").ok());
+        let price_history_file = cli.price_history_file
+            .or(file_config.price_history_file)
+            .or(env::var("PRICE_HISTORY_FILE").ok());
 
         Self {
             tycho_url,
@@ -246,6 +254,57 @@ impl AppConfig {
             buy_token_address,
             sell_amount_value,
             display_numeraire_token_address,
+            price_history_file,
         }
     }
-} 
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_python_bindings(
+        tycho_url: String,
+        tycho_api_key: String,
+        chain_name: String,
+        rpc_url: Option<String>,
+        native_token_address_hex: Option<String>,
+        numeraire_token_hex: Option<String>,
+        probe_depth: Option<u128>,
+        max_hops: Option<usize>,
+        avg_gas_units_per_swap: Option<u64>,
+        gas_price_gwei: Option<u64>,
+        tvl_threshold: Option<f64>,
+        // tokens_file and price_history_file are omitted for Python bindings for now
+        // as they are less likely to be configured this way.
+    ) -> Result<Self, String> {
+        let chain_enum = Chain::from_str(&chain_name)
+            .map_err(|_| format!("Invalid chain name: {}", chain_name))?;
+
+        let native_token_address = native_token_address_hex
+            .map(|hex| Bytes::from_str(&hex))
+            .transpose()
+            .map_err(|e| format!("Invalid native_token_address: {}", e))?;
+
+        let numeraire_token = numeraire_token_hex
+            .map(|hex| Bytes::from_str(&hex))
+            .transpose()
+            .map_err(|e| format!("Invalid numeraire_token: {}", e))?;
+
+        Ok(Self {
+            tycho_url,
+            tycho_api_key,
+            chain: chain_enum,
+            tvl_threshold: tvl_threshold.unwrap_or(100.0),
+            rpc_url,
+            gas_price_gwei,
+            avg_gas_units_per_swap,
+            native_token_address,
+            max_hops,
+            numeraire_token,
+            probe_depth,
+            tokens_file: None, // Not configured via Python for now
+            sell_token_address: None, // Not relevant for general quoter init
+            buy_token_address: None, // Not relevant for general quoter init
+            sell_amount_value: None, // Not relevant for general quoter init
+            display_numeraire_token_address: None, // Not relevant for general quoter init
+            price_history_file: None, // Not configured via Python for now
+        })
+    }
+}

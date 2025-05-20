@@ -24,10 +24,14 @@ use petgraph::visit::EdgeRef;
 use rayon::prelude::*;
 use std::str::FromStr;
 
+use futures::future::join_all; // For collecting async tasks
+
 // Default WETH address (mainnet)
 const DEFAULT_ETH_ADDRESS_STR: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 // Default probe depth: 1 unit (e.g., 1 ETH or 1 USDC, assuming 18 decimals for default numeraire)
 const DEFAULT_PROBE_DEPTH: u128 = 1_000_000_000_000_000_000;
+const DEFAULT_AVG_GAS_UNITS_PER_SWAP: u64 = 150_000;
+const DEFAULT_NATIVE_DECIMALS: u32 = 18; // Changed to u32
 
 fn default_eth_address_bytes() -> Bytes {
     Bytes::from_str(DEFAULT_ETH_ADDRESS_STR).expect("Failed to parse default ETH address")
@@ -43,6 +47,8 @@ pub struct PriceEngine {
     pub max_hops: usize,
     pub numeraire_token: Option<Bytes>,
     pub probe_depth: Option<u128>,
+    pub native_token_address: Bytes, // Added
+    pub avg_gas_units_per_swap: u64, // Added, no longer Option
 }
 
 impl PriceEngine {
@@ -60,13 +66,28 @@ impl PriceEngine {
             max_hops: 3,
             numeraire_token: None,
             probe_depth: None,
+            native_token_address: default_eth_address_bytes(), // Default native token
+            avg_gas_units_per_swap: DEFAULT_AVG_GAS_UNITS_PER_SWAP, // Default gas units
         }
     }
 
     /// Create a PriceEngine reusing an existing shared cache with custom gas price and hop limit.
+    // This constructor might need updating if native_token_address and avg_gas_units_per_swap are critical.
+    // For now, it uses defaults like ::new(). Consider passing them as args if customization is needed here.
     pub fn with_cache(tracker: ComponentTracker, graph: Arc<RwLock<TokenGraph>>, cache: Arc<RwLock<QuoteCache>>, gas_price_wei: Arc<RwLock<u128>>, max_hops: usize) -> Self {
         let pathfinder = Pathfinder::new(graph.clone());
-        Self { tracker, graph, pathfinder, cache, gas_price_wei, max_hops, numeraire_token: None, probe_depth: None }
+        Self { 
+            tracker, 
+            graph, 
+            pathfinder, 
+            cache, 
+            gas_price_wei, 
+            max_hops, 
+            numeraire_token: None, 
+            probe_depth: None,
+            native_token_address: default_eth_address_bytes(), // Default native token
+            avg_gas_units_per_swap: DEFAULT_AVG_GAS_UNITS_PER_SWAP, // Default gas units
+        }
     }
     
     pub fn from_config(tracker: ComponentTracker, graph: Arc<RwLock<TokenGraph>>, cache: Arc<RwLock<QuoteCache>>, config: &AppConfig) -> Self {
@@ -79,6 +100,9 @@ impl PriceEngine {
             .map(|gwei| u128::from(gwei) * 1_000_000_000) // Convert Gwei to Wei
             .unwrap_or(30_000_000_000u128); // Default to 30 Gwei (30*10^9 Wei)
 
+        let native_token_address = config.native_token_address.clone().unwrap_or_else(default_eth_address_bytes);
+        let avg_gas_units_per_swap = config.avg_gas_units_per_swap.unwrap_or(DEFAULT_AVG_GAS_UNITS_PER_SWAP);
+
         Self {
             tracker,
             graph,
@@ -88,11 +112,14 @@ impl PriceEngine {
             max_hops,
             numeraire_token: numeraire,
             probe_depth,
+            native_token_address,
+            avg_gas_units_per_swap,
         }
     }
 
     /// Compute a price quote for a given input token, output token, and amount, using the best path only.
-    pub fn quote(&self, token_in: &Bytes, token_out: &Bytes, amount_in: u128, block: Option<u64>) -> PriceQuote {
+    // This should also become async if quote_multi is async
+    pub async fn quote(&self, token_in: &Bytes, token_out: &Bytes, amount_in: u128, block: Option<u64>) -> PriceQuote {
         let current_block = block.unwrap_or(0);
         let cache_key = QuoteCacheKey { sell_token: token_in.clone(), buy_token: token_out.clone(), amount: amount_in, block: current_block };
         
@@ -113,7 +140,7 @@ impl PriceEngine {
             };
         }
 
-        let pq = self.quote_multi(token_in, token_out, amount_in, 1, block);
+        let pq = self.quote_multi(token_in, token_out, amount_in, 1, block).await; // Added .await
 
         if let Some(amt) = pq.amount_out {
             let cached_value = CachedQuote {
@@ -135,7 +162,7 @@ impl PriceEngine {
     }
 
     /// Compute a price quote for a given input token, output token, and amount, simulating up to K paths.
-    pub fn quote_multi(&self, token_in: &Bytes, token_out: &Bytes, amount_in: u128, k: usize, block: Option<u64>) -> PriceQuote {
+    pub async fn quote_multi(&self, token_in: &Bytes, token_out: &Bytes, amount_in: u128, k: usize, block: Option<u64>) -> PriceQuote { // Made async
         let current_block = block.unwrap_or(0);
         
         let all_paths_nodes: Vec<Vec<NodeIndex>> = {
@@ -203,15 +230,32 @@ impl PriceEngine {
             }
         }
 
-        // Parallel evaluation of paths
-        let evaluated_paths: Vec<SinglePathQuote> = tasks.par_iter()
-            .map(|(node_path, edge_seq)| {
-                self.quote_single_path_with_edges(token_in, token_out, amount_in, node_path, edge_seq, Some(current_block))
-            })
-            .filter(|pq| pq.amount_out.is_some())
+        // Asynchronous evaluation of paths
+        let mut path_futures = Vec::new();
+        for (node_path, edge_seq) in tasks {
+            // Clone `self` or necessary Arcs for each async task if `quote_single_path_with_edges` needs `&self`
+            // For now, assuming `quote_single_path_with_edges` can be called if `self` is Arc-ed or if it takes Arcs.
+            // Let's make it take `self: Arc<Self>` or pass necessary Arcs directly.
+            // Simpler: `self.quote_single_path_with_edges` takes `&self`, so we need to ensure `self` outlives the futures.
+            // This is fine if `quote_multi` is awaited before `self` is dropped.
+            let future = self.quote_single_path_with_edges(
+                token_in.clone(), 
+                token_out.clone(), 
+                amount_in, 
+                node_path, // node_path is Vec<NodeIndex>, can be moved
+                edge_seq, // edge_seq is Vec<EdgeIndex>, can be moved
+                Some(current_block)
+            );
+            path_futures.push(future);
+        }
+        
+        let evaluated_paths_results: Vec<SinglePathQuote> = join_all(path_futures).await
+            .into_iter()
+            .filter(|pq| pq.amount_out.is_some()) // Filter out paths that resulted in None amount_out
             .collect();
         
         // Sort by net amount_out descending
+        let mut sorted_paths = evaluated_paths_results; // Use the collected results
         let mut sorted_paths = evaluated_paths;
         sorted_paths.sort_by(|a, b| b.amount_out.cmp(&a.amount_out));
         sorted_paths.truncate(k);
@@ -223,11 +267,13 @@ impl PriceEngine {
         let best_path_details = sorted_paths[0].clone();
         
         // Calculate mid_price based on the new two-way swap logic using engine's numeraire
-        let mid_price_of_token_in_vs_token_out = if token_in == token_out {
+        let mid_price_of_token_in_vs_token_out = if *token_in == *token_out { // Deref Bytes for comparison
             Some(Decimal::ONE)
         } else {
-            let price_in_vs_n = self.get_token_price(token_in, Some(current_block));
-            let price_out_vs_n = self.get_token_price(token_out, Some(current_block));
+            let price_in_vs_n_fut = self.get_token_price(token_in, Some(current_block));
+            let price_out_vs_n_fut = self.get_token_price(token_out, Some(current_block));
+            let (price_in_vs_n, price_out_vs_n) = tokio::join!(price_in_vs_n_fut, price_out_vs_n_fut); // Await futures concurrently
+
             if let (Some(p_in), Some(p_out)) = (price_in_vs_n, price_out_vs_n) {
                 if !p_out.is_zero() {
                     Some(p_in / p_out)
@@ -285,32 +331,69 @@ impl PriceEngine {
 
     // This is a method that would now live in quoting.rs or be called from there.
     // For now, it stays here to ensure `quote_multi` compiles.
-    pub fn quote_single_path_with_edges(&self, token_in: &Bytes, token_out: &Bytes, amount_in: u128, path: &[NodeIndex], edge_seq: &[EdgeIndex], block: Option<u64>) -> SinglePathQuote {
-        let graph_r = self.graph.read().unwrap();
-        let gross_amount_out = simulation::simulate_path_gross(&self.tracker, &graph_r, amount_in, path, edge_seq, block);
+    // Made async because it calls async self.get_token_price
+    pub async fn quote_single_path_with_edges(&self, token_in: Bytes, token_out: Bytes, amount_in: u128, path: Vec<NodeIndex>, edge_seq: Vec<EdgeIndex>, block: Option<u64>) -> SinglePathQuote {
+        // Note: token_in, token_out, path, edge_seq are now owned params due to async context.
+        let graph_r = self.graph.read().unwrap(); // This lock needs to be managed carefully in async.
+                                                 // If held across .await, it can cause deadlocks or contention.
+                                                 // For now, assume it's short-lived.
+        let gross_amount_out = simulation::simulate_path_gross(&self.tracker, &graph_r, amount_in, &path, &edge_seq, block);
 
         if gross_amount_out.is_none() {
             return quoting::invalid_path_quote(path, edge_seq, amount_in);
         }
         let gross_amount_out_val = gross_amount_out.unwrap();
+        let current_block_num = block.unwrap_or(0); // For get_token_price calls
 
-        // Dummy values for other fields for now
-        let gas_estimate = edge_seq.len() as u64 * 100_000; // Simplified gas
-        // Ensure gas price is read correctly and provide a default if necessary
-        let current_gas_price_wei = self.gas_price_wei.read().map(|g| *g).unwrap_or(10_000_000_000u128); // Default to 10 Gwei if read fails
-        let gas_cost_eth_approx = Decimal::from(gas_estimate) * Decimal::from(current_gas_price_wei) / Decimal::new(10i64.pow(18), 0);
+        // --- Gas Calculation Start ---
+        let gas_estimate_units = edge_seq.len() as u64 * self.avg_gas_units_per_swap;
+        
+        let native_token_decimals = self.tracker.all_tokens.read().unwrap()
+            .get(&self.native_token_address)
+            .map_or(DEFAULT_NATIVE_DECIMALS, |token_meta| token_meta.decimals as u32);
+
+        let current_gas_price_wei_val = *self.gas_price_wei.read().unwrap();
+        let gas_cost_in_native_token_units = gas_estimate_units as u128 * current_gas_price_wei_val;
+        
+        let gas_cost_native_decimal = Decimal::from_i128_with_scale(gas_cost_in_native_token_units as i128, native_token_decimals);
+        
+        let mut gas_cost_in_token_out_decimal = Decimal::ZERO;
+
+        if token_out == self.native_token_address { // Deref not needed due to owned Bytes
+            gas_cost_in_token_out_decimal = gas_cost_native_decimal;
+        } else {
+            // Await the get_token_price calls
+            let price_native_vs_numeraire_fut = self.get_token_price(&self.native_token_address, Some(current_block_num));
+            let price_out_vs_numeraire_fut = self.get_token_price(&token_out, Some(current_block_num)); // Use owned token_out
+            let (price_native_vs_numeraire, price_out_vs_numeraire) = tokio::join!(price_native_vs_numeraire_fut, price_out_vs_numeraire_fut);
+
+
+            if let (Some(p_native), Some(p_out)) = (price_native_vs_numeraire, price_out_vs_numeraire) {
+                if !p_out.is_zero() {
+                    let price_of_native_in_terms_of_token_out = p_native / p_out;
+                    gas_cost_in_token_out_decimal = gas_cost_native_decimal * price_of_native_in_terms_of_token_out;
+                } else {
+                    // Price of output token is zero, cannot convert gas cost. Log or handle as error.
+                    // For now, gas_cost_in_token_out_decimal remains zero.
+                }
+            } else {
+                // Could not get prices for conversion. Log or handle.
+                // For now, gas_cost_in_token_out_decimal remains zero.
+            }
+        }
+        // --- Gas Calculation End ---
 
         let amount_in_dec = Decimal::from(amount_in);
         let gross_amount_out_dec = Decimal::from(gross_amount_out_val);
         
-        let token_in_model = self.tracker.all_tokens.read().unwrap().get(token_in).cloned();
-        let token_out_model = self.tracker.all_tokens.read().unwrap().get(token_out).cloned();
+        let token_in_model = self.tracker.all_tokens.read().unwrap().get(&token_in).cloned(); // Use owned token_in
+        let token_out_model = self.tracker.all_tokens.read().unwrap().get(&token_out).cloned(); // Use owned token_out
 
         if token_in_model.is_none() || token_out_model.is_none() {
-             return quoting::invalid_path_quote(path, edge_seq, amount_in);
+             return quoting::invalid_path_quote(&path, &edge_seq, amount_in); // Pass slices
         }
-        let _t_in = token_in_model.unwrap(); // Prefixed with underscore
-        let t_out = token_out_model.unwrap();
+        let _t_in = token_in_model.unwrap(); 
+        let _t_out = token_out_model.unwrap(); // No longer t_out, use _t_out for consistency
 
         // Calculate total protocol fee in BPS and as a Decimal amount
         let mut total_protocol_fee_bps = Decimal::ZERO;
@@ -336,7 +419,8 @@ impl PriceEngine {
             Decimal::ZERO
         };
 
-        let net_amount_out_dec = gross_amount_out_dec - protocol_fee_amount_dec - gas_cost_eth_approx;
+        // Use the new gas_cost_in_token_out_decimal
+        let net_amount_out_dec = gross_amount_out_dec - protocol_fee_amount_dec - gas_cost_in_token_out_decimal;
         let net_amount_out_dec = net_amount_out_dec.max(Decimal::ZERO); // Ensure not negative
 
         let net_amount_out = net_amount_out_dec.to_u128().unwrap_or(0);
@@ -366,28 +450,36 @@ impl PriceEngine {
 
         SinglePathQuote {
             amount_out: Some(net_amount_out),
-            route: path.iter().map(|idx| graph_r.graph.node_weight(*idx).unwrap().address.clone()).collect(),
-            mid_price: mid_price_approx_net, // Use net mid_price for the quote summary
+            route: path.iter().map(|idx| graph_r.graph.node_weight(*idx).unwrap().address.clone()).collect(), // path is Vec
+            mid_price: mid_price_approx_net, 
             slippage_bps: slippage,
             fee_bps: fee_bps_for_quote, 
-            gas_estimate: Some(gas_estimate),
+            gas_estimate: Some(gas_estimate_units), // Use the calculated gas units
             gross_amount_out: Some(gross_amount_out_val),
             spread_bps: spread,
-            price_impact_bps: price_impact, // Price impact is usually based on gross output before external fees/gas
-            pools: edge_seq.iter().map(|e_idx| graph_r.graph.edge_weight(*e_idx).unwrap().pool_id.clone()).collect(),
+            price_impact_bps: price_impact, 
+            pools: edge_seq.iter().map(|e_idx| graph_r.graph.edge_weight(*e_idx).unwrap().pool_id.clone()).collect(), // edge_seq is Vec
             input_amount: Some(amount_in),
-            node_path: path.to_vec(),
-            edge_seq: edge_seq.to_vec(),
-            // New fields for detailed fee/gas reporting if the struct supports them:
-            // gas_cost_token_out_approx: Some(gas_cost_eth_approx), // Assuming SinglePathQuote is extended
-            // protocol_fee_bps: Some(total_protocol_fee_bps), // This is now fee_bps
-            // path_protocol_fees_bps: Some(path_protocol_fees_bps),
-            // items: vec![], // Placeholder for more detailed hop-by-hop items if needed later
+            node_path: path, // path is now owned Vec
+            edge_seq: edge_seq, // edge_seq is now owned Vec
+            gas_cost_native: Some(gas_cost_native_decimal), 
+            gas_cost_in_token_out: Some(gas_cost_in_token_out_decimal), 
         }
     }
 
+    pub fn update_graph_from_tracker_state(&self) {
+        let mut graph_w = self.graph.write().unwrap();
+        // The tracker is part of PriceEngine, so we can access its components directly.
+        // No need to pass them as arguments.
+        graph_w.update_from_components_with_tracker(
+            &self.tracker.all_pools.read().unwrap(),
+            &self.tracker.pool_states.read().unwrap(),
+            &self.tracker.all_tokens.read().unwrap(),
+        );
+    }
+
     // Renamed from the sketch to avoid potential naming conflicts if it were public
-    fn calculate_token_price_in_numeraire_impl(
+    async fn calculate_token_price_in_numeraire_impl( // Made async
         &self,
         target_token: &Bytes,
         numeraire_token: &Bytes,
@@ -473,7 +565,7 @@ impl PriceEngine {
 
     /// Calculates the mid-price of a token in terms of the engine's configured numeraire (or ETH default).
     /// Uses a two-way swap with a configured probe depth.
-    pub fn get_token_price(&self, token: &Bytes, block: Option<u64>) -> Option<Decimal> {
+    pub async fn get_token_price(&self, token: &Bytes, block: Option<u64>) -> Option<Decimal> { // Made async
         let engine_numeraire = self.numeraire_token.clone().unwrap_or_else(default_eth_address_bytes);
         let probe_amount = self.probe_depth.unwrap_or(DEFAULT_PROBE_DEPTH);
 
@@ -501,16 +593,16 @@ impl PriceEngine {
         let path_n_to_t_edges = path_n_to_t_edges_opt.unwrap();
         let path_t_to_n_edges = path_t_to_n_edges_opt.unwrap();
 
-        self.calculate_token_price_in_numeraire_impl(
+        self.calculate_token_price_in_numeraire_impl( // Await the async call
             token,              // target_token for the function signature
             &engine_numeraire,  // numeraire_token for the function signature
             probe_amount,       // probe_amount_of_numeraire
-            &path_n_to_t_nodes[..], // Renamed & Sliced
-            &path_n_to_t_edges[..], // Renamed & Sliced
-            &path_t_to_n_nodes[..], // Renamed & Sliced
-            &path_t_to_n_edges[..], // Renamed & Sliced
+            &path_n_to_t_nodes[..], 
+            &path_n_to_t_edges[..], 
+            &path_t_to_n_nodes[..], 
+            &path_t_to_n_edges[..], 
             block,
-        )
+        ).await // Added await
     }
 
      // Other methods like precompute_all_quotes, log_all_paths, list_unit_price_vs_eth, etc.

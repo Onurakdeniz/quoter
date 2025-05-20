@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::types::QuoteResult; // Import the main QuoteResult for continuous pricing
+// use crate::types::QuoteResult; // Import the main QuoteResult for continuous pricing
+use rust_decimal::Decimal;
 
 /// Cache key for a quote: (sell_token, buy_token, amount, block number)
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
@@ -60,32 +61,26 @@ pub struct CacheMetrics {
 /// Cached continuous price result, derived from types::QuoteResult
 #[derive(Clone, Debug)]
 pub struct CachedContinuousPrice {
-    pub amount_out_gross: f64,
-    pub path: Vec<Bytes>,
-    pub total_fee: f64,
-    pub estimated_slippage: Option<f64>,
-    pub gas_cost_native: Option<f64>,
-    pub gas_cost_token_out: Option<f64>,
-    pub amount_out_net: f64,
-    pub block: u64, // Block at which this price was calculated
+    pub price: Option<Decimal>, // Price in terms of the global numeraire
+    pub block: u64,             // Block at which this price was calculated
     // Numeraire is implicit (the one configured globally for the continuous updater)
 }
 
-impl From<(QuoteResult, u64)> for CachedContinuousPrice {
-    fn from(data: (QuoteResult, u64)) -> Self {
-        let (qr, block_num) = data;
-        CachedContinuousPrice {
-            amount_out_gross: qr.amount_out_gross,
-            path: qr.path,
-            total_fee: qr.total_fee,
-            estimated_slippage: qr.estimated_slippage,
-            gas_cost_native: qr.gas_cost_native,
-            gas_cost_token_out: qr.gas_cost_token_out,
-            amount_out_net: qr.amount_out_net,
-            block: block_num,
-        }
-    }
-}
+// impl From<(QuoteResult, u64)> for CachedContinuousPrice {
+//     fn from(data: (QuoteResult, u64)) -> Self {
+//         let (qr, block_num) = data;
+//         CachedContinuousPrice {
+//             amount_out_gross: qr.amount_out_gross,
+//             path: qr.path,
+//             total_fee: qr.total_fee,
+//             estimated_slippage: qr.estimated_slippage,
+//             gas_cost_native: qr.gas_cost_native,
+//             gas_cost_token_out: qr.gas_cost_token_out,
+//             amount_out_net: qr.amount_out_net,
+//             block: block_num,
+//         }
+//     }
+// }
 
 /// Main quote cache structure with LRU and path cache
 pub struct QuoteCache {
