@@ -2,7 +2,7 @@
 # will have compiled files and executables
 debug/
 target/
-
+*.md
 
 
 
@@ -41,3 +41,5 @@ flamegraph.svg
 repomix-output.txt
 
 details.md
+
+/impl

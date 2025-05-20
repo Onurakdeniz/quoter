@@ -1,308 +1,267 @@
-mod cli;
-use crate::cli::{Cli, CliHandler};
-use price_quoter::{component_tracker::ComponentTracker, graph::TokenGraph, price_engine::PriceEngine, config::AppConfig, utils::token_list, history};
-use clap::Parser;
-use tokio::time::{interval, Duration};
-use futures::StreamExt;
-use std::sync::{Arc, RwLock};
-use tycho_simulation::tycho_common::Bytes;
+use anyhow::Result;
+use price_quoter::config::AppConfig;
+use price_quoter::engine::{PriceEngine, graph::TokenGraph};
+use price_quoter::data_management::component_tracker::ComponentTracker;
+use price_quoter::Bytes;
 use std::str::FromStr;
-use num_traits::cast::ToPrimitive;
-use std::time::Instant;
-use tracing::info;
-use reqwest::Client;
-use serde_json::json;
-use hex;
+use futures_util::StreamExt;
+use price_quoter::data_management::cache::QuoteCache;
+use std::sync::{Arc, RwLock};
+// Use prelude for Decimal and common traits like FromPrimitive
+use rust_decimal::prelude::*;
 
-const REFRESH_SECS: u64 = 6;
-const GAS_REFRESH_SECS: u64 = 10;
+// Helper to get token symbol and decimals
+// Returns (Symbol, Decimals)
+fn get_token_symbol_decimals(tracker: &ComponentTracker, token_address_bytes: &Bytes) -> (String, u8) {
+    if let Some(data) = tracker.all_tokens.read().unwrap().get(token_address_bytes) {
+        (data.symbol.clone(), data.decimals.try_into().unwrap_or(18_u8)) // Ensure u8, default 18
+    } else {
+        // Fallback if token not found in tracker
+        (token_address_bytes.to_string(), 18_u8) // Show hex and assume 18 decimals
+    }
+}
+
+// Helper to format raw u128 amount to a human-readable string
+fn format_token_amount(raw_amount: u128, decimals: u8) -> String {
+    if decimals == 0 {
+        return format!("{}", raw_amount);
+    }
+    let divisor = Decimal::from(10u64.pow(decimals as u32));
+    let amount_decimal = Decimal::from(raw_amount) / divisor;
+    amount_decimal.round_dp(6).to_string() // Display with 6 decimal places
+}
+
+// Helper to format a route (Vec<Bytes>) into a String of symbols
+fn format_route_symbols(tracker: &ComponentTracker, route_bytes: &[Bytes]) -> String {
+    route_bytes.iter()
+        .map(|addr_bytes| get_token_symbol_decimals(tracker, addr_bytes).0)
+        .collect::<Vec<String>>()
+        .join(" -> ")
+}
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("price_quoter=info,price_quoter_cli=info")
-        .init();
-    let cli = Cli::parse();
-    let mut config = AppConfig::load();
+async fn main() -> Result<()> {
+    // Load AppConfig using load_with_cli to respect CLI args, file, and env vars
+    let config = AppConfig::load_with_cli(); 
 
-    // CLI overrides
-    if let Some(ref n_token_str) = cli.numeraire_token {
-        if let Ok(bytes) = Bytes::from_str(n_token_str) {
-            config.numeraire_token = Some(bytes);
-        }
-    }
-    if let Some(depth) = cli.probe_depth {
-        config.probe_depth = Some(depth);
-    }
-    if let Some(max_hops_cli) = cli.max_hops {
-        config.max_hops = Some(max_hops_cli);
-    }
-    if let Some(ref path) = cli.tokens_file {
-        config.tokens_file = Some(path.clone());
-    }
+    // Get operational parameters from config, ensuring they are provided
+    let sell_token_str = config.sell_token_address.clone().ok_or_else(|| anyhow::anyhow!("--sell-token is required"))?;
+    let buy_token_str = config.buy_token_address.clone().ok_or_else(|| anyhow::anyhow!("--buy-token is required"))?;
+    let sell_amount_f64 = config.sell_amount_value.ok_or_else(|| anyhow::anyhow!("--sell-amount is required"))?;
+    // display_numeraire_token is optional for the quote display, not used by engine directly for core logic
+    // let _display_numeraire_str = config.display_numeraire_token_address;
 
-    if let Some(ref url) = config.rpc_url {
-        std::env::set_var("RPC_URL", url);
-    }
+    let tracker = ComponentTracker::new();
+    // Wrap TokenGraph in Arc<RwLock<>> for shared mutable access
+    let graph_arc = Arc::new(RwLock::new(TokenGraph::new())); 
 
-    let mut tracker = ComponentTracker::new();
-    let updates_stream = tracker.stream_updates(&config.tycho_url, config.chain, &config.tycho_api_key, config.tvl_threshold).await?;
+    // Ingest state from Tycho Indexer
+    let updates = tracker
+        .stream_updates(
+            &config.tycho_url,
+            config.chain,
+            &config.tycho_api_key,
+            config.tvl_threshold,
+        )
+        .await?;
+    // Await at least one update to populate state
+    tokio::pin!(updates);
 
-    // Wrap in Pin<Box<...>> so that it implements `Unpin` for StreamExt::next()
-    let mut updates = Box::pin(updates_stream);
+    // Create a new cache instance for the engine
+    let engine_cache = Arc::new(RwLock::new(QuoteCache::new()));
 
-    // Wait first update
-    if updates.next().await.is_none() {
-        anyhow::bail!("Could not retrieve initial pool data.");
-    }
+    // Initialize PriceEngine using from_config
+    let engine = PriceEngine::from_config(
+        tracker.clone(), 
+        graph_arc.clone(), // Pass the Arc-wrapped graph
+        engine_cache, 
+        &config
+    );
 
-    let mut graph = TokenGraph::new();
-    {
-        let pools_r = tracker.all_pools.read().unwrap();
-        let states_r = tracker.pool_states.read().unwrap();
-        let tokens_r = tracker.all_tokens.read().unwrap();
-        graph.update_from_components_with_tracker(&pools_r, &states_r, &tokens_r);
-    }
+    let sell_token_bytes = Bytes::from_str(&sell_token_str).expect("Invalid sell token");
+    let buy_token_bytes = Bytes::from_str(&buy_token_str).expect("Invalid buy token");
+    
+    // Get sell and buy token info once
+    let (sell_token_symbol, sell_token_decimals) = get_token_symbol_decimals(&tracker, &sell_token_bytes);
+    let (buy_token_symbol, buy_token_decimals) = get_token_symbol_decimals(&tracker, &buy_token_bytes);
+    
+    // Calculate raw sell amount based on its decimals
+    let sell_amount_raw = Decimal::from_f64(sell_amount_f64).unwrap_or_default() * Decimal::from(10u64.pow(sell_token_decimals as u32));
+    let sell_amount_u128 = sell_amount_raw.to_u128().unwrap_or(0);
 
-    // Load token list once (empty if single-quote mode)
-    let tokens_to_track: Vec<Bytes> = if let Some(ref path) = config.tokens_file {
-        match token_list::load_token_list(path) {
-            Ok(list) => list,
-            Err(e) => {
-                eprintln!("[TOKEN_LIST_ERROR] {}", e);
-                Vec::new()
-            }
-        }
-    } else { Vec::new() };
 
-    let shared_cache = Arc::new(RwLock::new(price_quoter::cache::QuoteCache::new()));
-    let gas_price_shared = Arc::new(RwLock::new(config.gas_price_gwei.map(|g| g as u128 * 1_000_000_000u128).unwrap_or(30_000_000_000u128)));
+    let mut update_count = 0;
+    println!("Starting to listen for Tycho Indexer updates and quote continuously...");
+    println!("Quoting for: {} {} -> {}", sell_amount_f64, sell_token_symbol, buy_token_symbol);
 
-    // === NEW: Spawn background task to keep gas price updated ===
-    if let Some(rpc_url) = config.rpc_url.clone() {
-        let gas_price_handle = gas_price_shared.clone();
-        tokio::spawn(async move {
-            let client = Client::new();
-            let mut ticker = interval(Duration::from_secs(GAS_REFRESH_SECS));
-            loop {
-                ticker.tick().await; // wait first tick
-                // Build JSON-RPC payload
-                let payload = json!({
-                    "jsonrpc": "2.0",
-                    "method": "eth_gasPrice",
-                    "params": [],
-                    "id": 1
-                });
-                match client.post(&rpc_url).json(&payload).send().await {
-                    Ok(resp) => {
-                        if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                            if let Some(result_hex) = json_resp.get("result").and_then(|v| v.as_str()) {
-                                if let Ok(wei) = u128::from_str_radix(result_hex.trim_start_matches("0x"), 16) {
-                                    *gas_price_handle.write().unwrap() = wei;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[GAS_FETCH_ERROR] {}", e);
-                    }
-                }
-            }
-        });
-    } else {
-        eprintln!("[INFO] rpc_url not set, using static gas price");
-    }
 
-    // Initial engine usage for setup and initial quotes
-    {
-        let engine = PriceEngine::from_config(tracker.clone(), &graph, shared_cache.clone(), gas_price_shared.clone(), &config);
-        // Precompute all quotes with no block filter
-        engine.precompute_all_quotes(None);
-        if !tokens_to_track.is_empty() {
-            let eth_addr = config.numeraire_token.clone().expect("NUMERAIRE_TOKEN must be set for batch mode");
-            // Use a temporary engine ignoring probe_depth for listing
-            let list_engine = PriceEngine::with_cache(tracker.clone(), &graph, shared_cache.clone(), gas_price_shared.clone(), engine.max_hops);
-            let prices = list_engine.quote_tokens_vs_eth(&tokens_to_track, &eth_addr, 0, None);
-            for (tok, q) in prices {
-                history::append_token_price(&chrono::Utc::now().to_rfc3339(), 0, &tok, q.amount_out.unwrap_or(0), q.mid_price, "eth_prices.csv").ok();
-                let token_hex = format!("0x{}", hex::encode(&tok));
-                let cache_info = q.cache_block.map_or(String::new(), |b| format!(" (cached @ block {})", b));
-                if let Some(mid) = q.mid_price {
-                    println!("{} => {:.18} ETH{}", token_hex, mid.to_f64().unwrap_or(0.0), cache_info);
-                } else {
-                    println!("{} => N/A{}", token_hex, cache_info);
-                }
-            }
-        } else {
-            CliHandler::handle_quote(&cli, &engine, None);
-        }
-    }
-
-    // Periodic refresh (REMOVED - now only updates on new blocks)
-    // let mut ticker = interval(Duration::from_secs(REFRESH_SECS));
-    let mut last_block_number: Option<u64> = None;
     loop {
-        tokio::select! {
-            maybe_update = updates.next() => {
-                if let Some(block_update) = maybe_update { 
-                    // Extract block number (assuming BlockUpdate has a 'block_number' field)
-                    let current_block_number = block_update.block_number; 
-                    info!(block = current_block_number, "Received block update.");
-                    let block_opt = Some(current_block_number);
+        match updates.next().await {
+            Some(_block_update) => {
+                update_count += 1;
+                println!("\n--- Update Cycle: {} ---", update_count);
+                // You can inspect _block_update here if it contains useful info like block number
+                // For example: println!("Received Block: {:?}\", _block_update.block_number);
 
-                    // Invalidate cache for the previous block to force fresh quotes for each block
-                    if let Some(prev_block) = last_block_number {
-                        shared_cache.write().unwrap().invalidate_block(prev_block);
-                    }
-                    last_block_number = Some(current_block_number);
+                // Update the graph with the latest state from the tracker
+                {
+                    let mut graph_w = graph_arc.write().unwrap(); // Acquire write lock
+                    graph_w.update_from_components_with_tracker(
+                        &tracker.all_pools.read().unwrap(),
+                        &tracker.pool_states.read().unwrap(),
+                        &tracker.all_tokens.read().unwrap(),
+                    );
+                } // Write lock is released here
+                
+                // Check graph state after update (with a read lock)
+                let (node_count, edge_count) = {
+                    let graph_r = graph_arc.read().unwrap();
+                    (graph_r.graph.node_count(), graph_r.graph.edge_count())
+                };
 
-                    // Invalidate cache for pools/tokens impacted by this block update
-                    {
-                        let mut cache_w = shared_cache.write().unwrap();
-                        // Collect all changed pool IDs
-                        let changed_pools = block_update.new_pairs.keys()
-                            .chain(block_update.removed_pairs.keys())
-                            .chain(block_update.states.keys());
-                        for pool_id in changed_pools {
-                            cache_w.invalidate_pool(pool_id);
-                            // Also invalidate per-token cache for all tokens in this pool
-                            if let Some(component) = tracker.all_pools.read().unwrap().get(pool_id) {
-                                for token in &component.tokens {
-                                    cache_w.invalidate_token(&token.address);
-                                }
-                            }
-                        }
-                    }
-                    // Update graph on pool additions, removals, or liquidity/state changes
-                    if !block_update.new_pairs.is_empty() || !block_update.removed_pairs.is_empty() || !block_update.states.is_empty() {
-                        let pools_r = tracker.all_pools.read().unwrap();
-                        let states_r = tracker.pool_states.read().unwrap();
-                        let tokens_r = tracker.all_tokens.read().unwrap();
-                        graph.update_from_components_with_tracker(&pools_r, &states_r, &tokens_r);
-                        // Release locks
-                        drop(pools_r);
-                        drop(states_r);
-                        drop(tokens_r);
-                    }
-                    // Start timing quote generation separately
-                    let t_start = Instant::now();
-                    // Create a new engine instance for potentially updated graph/state
-                    let engine = PriceEngine::from_config(tracker.clone(), &graph, shared_cache.clone(), gas_price_shared.clone(), &config);
-                    
-                    // In batch mode (tokens_to_track non-empty), skip full precompute to reduce latency
-                    if !tokens_to_track.is_empty() {
-                        let eth_addr = config.numeraire_token.clone().expect("NUMERAIRE_TOKEN must be set for batch mode");
-                        // Pass actual block number down, using temporary engine to ignore probe_depth
-                        let list_engine = PriceEngine::with_cache(tracker.clone(), &graph, shared_cache.clone(), gas_price_shared.clone(), engine.max_hops);
-                        let prices = list_engine.quote_tokens_vs_eth(&tokens_to_track, &eth_addr, 0, block_opt);
-                        let now_str = chrono::Utc::now().to_rfc3339();
-                        // Use actual block number for history
-                        let history_block = current_block_number; 
-                        for (tok, q) in prices {
-                            // Persist raw net amount and mid_price to CSV
-                            history::append_token_price(
-                                &now_str,
-                                history_block,
-                                &tok,
-                                q.amount_out.unwrap_or(0),
-                                q.mid_price,
-                                "eth_prices.csv",
-                            ).ok();
-                            let token_hex = format!("0x{}", hex::encode(&tok));
-                            let cache_info = q.cache_block.map_or(String::new(), |b| format!(" (cached @ block {})", b));
-                            // Determine decimals for token and ETH
-                            let tokens_r = list_engine.tracker.all_tokens.read().unwrap();
-                            let token_dec = tokens_r.get(&tok).map(|t| t.decimals).unwrap_or(18) as i32;
-                            let eth_dec = tokens_r.get(&eth_addr).map(|t| t.decimals).unwrap_or(18) as i32;
-                            // Print net output amount and average price
-                            if let Some(amount_out) = q.amount_out {
-                                if amount_out > 0 {
-                                    let out_f = amount_out as f64 / 10f64.powi(eth_dec);
-                                    let avg_price = q.mid_price.unwrap_or_default().to_f64().unwrap_or(0.0);
-                                    print!("{} => {:.18} ETH (net) | avg_price: {} ETH", token_hex, out_f, avg_price);
-                                    // Print depth metrics if available
-                                    if let Some(depths) = &q.depth_metrics {
-                                        for (perc, depth_amt) in depths {
-                                            // depth_amt is input amount causing slippage
-                                            let depth_f = *depth_amt as f64 / 10f64.powi(token_dec);
-                                            print!(" | depth {} slippage: {:.6}", perc, depth_f);
-                                        }
-                                    }
-                                    println!("{}", cache_info);
-                                } else {
-                                    // Fallback: show spot price if available
-                                    let spot_price = list_engine.list_unit_price_vs_eth(&[tok.clone()], &eth_addr).get(0).map(|(_, p)| *p).unwrap_or_default();
-                                    let tokens_r = list_engine.tracker.all_tokens.read().unwrap();
-                                    let symbol = tokens_r.get(&tok).map(|t| t.symbol.clone()).unwrap_or_else(|| token_hex.clone());
-                                    if !spot_price.is_zero() {
-                                        let spot_f = spot_price.to_f64().unwrap_or(0.0);
-                                        if spot_f > 1e6 || (spot_f > 0.0 && spot_f < 1e-6) {
-                                            println!("{} ({}): N/A | spot price: {:.18} ETH [WARNING: Unrealistic spot price, likely no liquidity/path]{}", token_hex, symbol, spot_f, cache_info);
-                                        } else {
-                                            println!("{} ({}): N/A | spot price (no liquidity/fee check): {:.18} ETH{}", token_hex, symbol, spot_f, cache_info);
-                                        }
-                                    } else {
-                                        println!("{} ({}): N/A{}", token_hex, symbol, cache_info);
-                                    }
-                                }
+                if node_count == 0 {
+                    println!("Graph is empty after update. Skipping quote.");
+                    continue;
+                }
+
+                println!("Quoting with updated graph ({} nodes, {} edges)...", node_count, edge_count);
+
+                // Call the quote function
+                let quote = engine.quote_multi(&sell_token_bytes, &buy_token_bytes, sell_amount_u128, 5, None);
+
+                println!("\n--- Overall Best Quote Summary ---");
+                println!("Selling: {} {}", sell_amount_f64, sell_token_symbol);
+
+                if let Some(amount_out_raw) = quote.amount_out {
+                    let formatted_amount_out = format_token_amount(amount_out_raw, buy_token_decimals);
+                    println!("Receiving (Net): {} {}", formatted_amount_out, buy_token_symbol);
+
+                    if sell_amount_f64 > 0.0 { // Initial check for non-zero float sell_amount
+                        if let Some(sell_amount_decimal_val) = Decimal::from_f64(sell_amount_f64) {
+                            if !sell_amount_decimal_val.is_zero() {
+                                let buy_amount_decimal_val = Decimal::from(amount_out_raw) / Decimal::from(10u64.pow(buy_token_decimals as u32));
+                                let effective_price = buy_amount_decimal_val / sell_amount_decimal_val;
+                                println!("Effective Price: {} {} per {}", effective_price.round_dp(6), buy_token_symbol, sell_token_symbol);
                             } else {
-                                // Fallback: show spot price if available
-                                let spot_price = list_engine.list_unit_price_vs_eth(&[tok.clone()], &eth_addr).get(0).map(|(_, p)| *p).unwrap_or_default();
-                                let tokens_r = list_engine.tracker.all_tokens.read().unwrap();
-                                let symbol = tokens_r.get(&tok).map(|t| t.symbol.clone()).unwrap_or_else(|| token_hex.clone());
-                                if !spot_price.is_zero() {
-                                    let spot_f = spot_price.to_f64().unwrap_or(0.0);
-                                    if spot_f > 1e6 || (spot_f > 0.0 && spot_f < 1e-6) {
-                                        println!("{} ({}): N/A | spot price: {:.18} ETH [WARNING: Unrealistic spot price, likely no liquidity/path]{}", token_hex, symbol, spot_f, cache_info);
-                                    } else {
-                                        println!("{} ({}): N/A | spot price (no liquidity/fee check): {:.18} ETH{}", token_hex, symbol, spot_f, cache_info);
-                                    }
-                                } else {
-                                    println!("{} ({}): N/A{}", token_hex, symbol, cache_info);
-                                }
+                                println!("Effective Price: N/A (sell amount decimal is zero)");
                             }
+                        } else {
+                            println!("Effective Price: N/A (sell amount could not be converted to decimal)");
                         }
                     } else {
-                        // In single-quote mode, run full precompute before quoting
-                        engine.precompute_all_quotes(block_opt);
-                        // Pass actual block number down
-                        CliHandler::handle_quote(&cli, &engine, block_opt);
+                        println!("Effective Price: N/A (sell amount is not positive)");
                     }
-                    let elapsed = t_start.elapsed();
-                    // Use actual block number in log
-                    info!(block = current_block_number, latency_ms = ?elapsed.as_millis(), "block-to-quotes latency");
                 } else {
-                    info!("Tycho update stream ended.");
-                    break; // Exit loop if the stream ends
+                    println!("Receiving (Net): No quote available");
                 }
-            }
-            // Removed ticker branch to only update on new blocks
-            /*
-            _ = ticker.tick() => {
-                let engine = PriceEngine::from_config(tracker.clone(), &graph, shared_cache.clone(), gas_price_shared.clone(), &config);
-                engine.precompute_all_quotes();
-                if !tokens_to_track.is_empty() {
-                    let eth_addr = config.numeraire_token.clone().expect("NUMERAIRE_TOKEN must be set for batch mode");
-                    let prices = engine.quote_tokens_vs_eth(&tokens_to_track, &eth_addr, 0);
-                    for (tok, q) in prices {
-                        if let Some(out_amt) = q.amount_out {
-                            history::append_token_price(
-                                &chrono::Utc::now().to_rfc3339(),
-                                0,
-                                &tok,
-                                out_amt,
-                                q.mid_price,
-                                "eth_prices.csv",
-                            ).ok();
+                
+                if let Some(gross_amount_out_raw) = quote.gross_amount_out {
+                     let formatted_gross_amount_out = format_token_amount(gross_amount_out_raw, buy_token_decimals);
+                     println!("Receiving (Gross): {} {}", formatted_gross_amount_out, buy_token_symbol);
+                }
+
+                println!("Route (Best Path): {}", format_route_symbols(&tracker, &quote.route));
+                
+                if let Some(mid_price_engine) = quote.mid_price {
+                    println!("Mid Price (Engine): {} (Note: Internal engine rate, e.g., {} per {})", mid_price_engine.round_dp(8), sell_token_symbol, buy_token_symbol);
+                }
+                
+                // Print other summary details if they exist
+                quote.slippage_bps.map(|val| println!("Slippage (bps): {}", val));
+                quote.fee_bps.map(|val| println!("Fee (bps): {}", val));
+                quote.gas_estimate.map(|val| println!("Gas Estimate: {}", val));
+                quote.spread_bps.map(|val| println!("Spread (bps): {}", val));
+                quote.price_impact_bps.map(|val| println!("Price Impact (bps): {}", val));
+                quote.cache_block.map(|val| println!("Cache Block: {}", val));
+
+
+                if !quote.path_details.is_empty() {
+                    println!("\n--- Top {} Path Details ---", quote.path_details.len());
+                    for (i, detail) in quote.path_details.iter().enumerate() {
+                        println!("  Path {}:", i + 1);
+                        println!("    Route: {}", format_route_symbols(&tracker, &detail.route));
+                        println!("    Pool IDs: {:?}", detail.pools);
+
+                        let (path_input_symbol, path_input_decimals) = if let Some(first_token_in_route) = detail.route.first() {
+                            get_token_symbol_decimals(&tracker, first_token_in_route)
+                        } else {
+                            (sell_token_symbol.clone(), sell_token_decimals) // Fallback
+                        };
+                        let (path_output_symbol, path_output_decimals) = if let Some(last_token_in_route) = detail.route.last() {
+                            get_token_symbol_decimals(&tracker, last_token_in_route)
+                        } else {
+                            (buy_token_symbol.clone(), buy_token_decimals) // Fallback
+                        };
+
+                        if let Some(input_raw) = detail.input_amount {
+                            let formatted_input = format_token_amount(input_raw, path_input_decimals);
+                            println!("    Input Amount (Path Sim): {} {}", formatted_input, path_input_symbol);
+
+                            if let Some(output_raw) = detail.amount_out {
+                                let formatted_output = format_token_amount(output_raw, path_output_decimals);
+                                println!("    Net Amount Out (Path Sim): {} {}", formatted_output, path_output_symbol);
+
+                                // Calculate effective price for this path
+                                let input_dec = Decimal::from(input_raw) / Decimal::from(10u64.pow(path_input_decimals as u32));
+                                if !input_dec.is_zero() {
+                                    let output_dec = Decimal::from(output_raw) / Decimal::from(10u64.pow(path_output_decimals as u32));
+                                    let path_price = output_dec / input_dec;
+                                    println!("    Effective Price (Path Sim): {} {} per {}", path_price.round_dp(6), path_output_symbol, path_input_symbol);
+                                }
+                            } else {
+                                println!("    Net Amount Out (Path Sim): N/A");
+                            }
+                        } else {
+                            println!("    Input Amount (Path Sim): N/A");
+                        }
+                         if let Some(gross_out_raw) = detail.gross_amount_out {
+                            let formatted_gross_output = format_token_amount(gross_out_raw, path_output_decimals);
+                            println!("    Gross Amount Out (Path Sim): {} {}", formatted_gross_output, path_output_symbol);
+                        }
+
+                        if let Some(mid_price_path_raw) = detail.mid_price {
+                             // detail.mid_price is raw_buy_units / raw_sell_units for that specific simulation
+                             // To make it BUY_TOKEN per SELL_TOKEN: mid_price_raw * (10^sell_decimals) / (10^buy_decimals)
+                            let scaled_mid_price = mid_price_path_raw * Decimal::from(10u64.pow(path_input_decimals as u32)) / Decimal::from(10u64.pow(path_output_decimals as u32));
+                            println!("    Mid Price (Path Sim): {} {} per {}", scaled_mid_price.round_dp(6), path_output_symbol, path_input_symbol);
                         }
                     }
-                } else {
-                    CliHandler::handle_quote(&cli, &engine);
                 }
+
+                if let Some(metrics) = &quote.depth_metrics {
+                    println!("\n--- Depth Metrics ---");
+                    for (slippage_target, depth_amount_raw) in metrics {
+                        // Assuming depth_amount is in terms of the sell_token for now
+                        let formatted_depth = format_token_amount(*depth_amount_raw, sell_token_decimals);
+                        println!("  Slippage {}: Amount {} {}", slippage_target, formatted_depth, sell_token_symbol);
+                    }
+                }
+            },
+            None => {
+                println!("Tycho Indexer update stream ended or an error occurred. Exiting.");
+                break;
             }
-            */
         }
     }
 
     Ok(())
 }
+
+// Example Clap structure (if you add clap as a dependency)
+/*
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[arg(long)]
+    sell_token: String,
+    #[arg(long)]
+    buy_token: String,
+    #[arg(long)]
+    sell_amount: f64,
+    #[arg(long)]
+    numeraire_token: Option<String>,
+    // Add other arguments from your run.md command
+}
+*/ 

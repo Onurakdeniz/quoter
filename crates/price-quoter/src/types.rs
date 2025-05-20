@@ -41,10 +41,13 @@ pub struct QuoteRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteResult {
-    pub amount_out: f64,
+    pub amount_out_gross: f64,
     pub path: Vec<Bytes>,
     pub total_fee: f64,
     pub estimated_slippage: Option<f64>,
+    pub gas_cost_native: Option<f64>,
+    pub gas_cost_token_out: Option<f64>,
+    pub amount_out_net: f64,
 }
 
 pub type Result<T> = std::result::Result<T, PriceQuoterError>;

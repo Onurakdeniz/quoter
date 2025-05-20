@@ -5199,37 +5199,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "price-quoter-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "futures 0.3.31",
- "price-quoter",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "price-quoter-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
- "futures 0.3.31",
- "hex",
- "num-traits",
+ "futures-util",
  "price-quoter",
- "reqwest 0.11.27",
- "rustyline",
- "serde_json",
+ "rust_decimal",
  "tokio",
- "tracing",
- "tracing-subscriber",
  "tycho-simulation",
 ]
 

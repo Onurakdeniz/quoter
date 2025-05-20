@@ -5,7 +5,6 @@ use std::str::FromStr;
 use tycho_simulation::tycho_common::models::Chain;
 use tycho_simulation::tycho_common::Bytes;
 use tracing::info;
-use std::fs;
 use serde::Deserialize;
 
 #[cfg(feature = "cli")]
@@ -19,10 +18,16 @@ pub struct AppConfig {
     pub tvl_threshold: f64,
     pub rpc_url: Option<String>,
     pub gas_price_gwei: Option<u64>,
+    pub avg_gas_units_per_swap: Option<u64>,
+    pub native_token_address: Option<Bytes>,
     pub max_hops: Option<usize>,
     pub numeraire_token: Option<Bytes>,
     pub probe_depth: Option<u128>,
     pub tokens_file: Option<String>,
+    pub sell_token_address: Option<String>,
+    pub buy_token_address: Option<String>,
+    pub sell_amount_value: Option<f64>,
+    pub display_numeraire_token_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,10 +38,16 @@ pub struct FileConfig {
     pub tvl_threshold: Option<f64>,
     pub rpc_url: Option<String>,
     pub gas_price_gwei: Option<u64>,
+    pub avg_gas_units_per_swap: Option<u64>,
+    pub native_token_address: Option<String>,
     pub max_hops: Option<usize>,
     pub numeraire_token: Option<String>,
     pub probe_depth: Option<u128>,
     pub tokens_file: Option<String>,
+    pub sell_token_address: Option<String>,
+    pub buy_token_address: Option<String>,
+    pub sell_amount_value: Option<f64>,
+    pub display_numeraire_token_address: Option<String>,
 }
 
 #[cfg(feature = "cli")]
@@ -58,6 +69,10 @@ pub struct CliConfig {
     #[arg(long)]
     pub gas_price_gwei: Option<u64>,
     #[arg(long)]
+    pub avg_gas_units_per_swap: Option<u64>,
+    #[arg(long)]
+    pub native_token_address: Option<String>,
+    #[arg(long)]
     pub max_hops: Option<usize>,
     #[arg(long)]
     pub numeraire_token: Option<String>,
@@ -65,6 +80,14 @@ pub struct CliConfig {
     pub probe_depth: Option<u128>,
     #[arg(long)]
     pub tokens_file: Option<String>,
+    #[arg(long)]
+    pub sell_token: Option<String>,
+    #[arg(long)]
+    pub buy_token: Option<String>,
+    #[arg(long)]
+    pub sell_amount: Option<f64>,
+    #[arg(long)]
+    pub display_numeraire_token: Option<String>,
 }
 
 impl AppConfig {
@@ -84,6 +107,7 @@ impl AppConfig {
 
         let rpc_url = env::var("RPC_URL").ok();
         let gas_price_gwei = env::var("GAS_PRICE_GWEI").ok().and_then(|s| s.parse().ok());
+        let avg_gas_units_per_swap = env::var("AVG_GAS_UNITS_PER_SWAP").ok().and_then(|s| s.parse().ok());
         let max_hops: Option<usize> = env::var("MAX_HOPS").ok().and_then(|s| s.parse().ok());
         if rpc_url.is_none() {
             info!("RPC_URL environment variable not set. Balancer/Curve simulations may be limited.");
@@ -92,6 +116,7 @@ impl AppConfig {
         // New optional env vars for P-2 feature
         let numeraire_token = env::var("NUMERAIRE_TOKEN").ok().and_then(|s| Bytes::from_str(&s).ok());
         let probe_depth = env::var("PROBE_DEPTH").ok().and_then(|s| s.parse().ok());
+        let native_token_address = env::var("NATIVE_TOKEN_ADDRESS").ok().and_then(|s| Bytes::from_str(&s).ok());
 
         Self {
             tycho_url,
@@ -100,10 +125,16 @@ impl AppConfig {
             tvl_threshold,
             rpc_url,
             gas_price_gwei,
+            avg_gas_units_per_swap,
+            native_token_address,
             max_hops,
             numeraire_token,
             probe_depth,
             tokens_file: env::var("TOKENS_FILE").ok(),
+            sell_token_address: None,
+            buy_token_address: None,
+            sell_amount_value: None,
+            display_numeraire_token_address: None,
         }
     }
 
@@ -117,13 +148,19 @@ impl AppConfig {
             tvl_threshold: None,
             rpc_url: None,
             gas_price_gwei: None,
+            avg_gas_units_per_swap: None,
             max_hops: None,
             numeraire_token: None,
             probe_depth: None,
             tokens_file: None,
+            sell_token_address: None,
+            buy_token_address: None,
+            sell_amount_value: None,
+            display_numeraire_token_address: None,
+            native_token_address: None,
         };
         if let Some(ref path) = cli.config {
-            if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(contents) = std::fs::read_to_string(path) {
                 if let Ok(cfg) = toml::from_str::<FileConfig>(&contents) {
                     file_config = cfg;
                 }
@@ -157,6 +194,13 @@ impl AppConfig {
         let gas_price_gwei = cli.gas_price_gwei
             .or(file_config.gas_price_gwei)
             .or(env::var("GAS_PRICE_GWEI").ok().and_then(|s| s.parse().ok()));
+        let avg_gas_units_per_swap = cli.avg_gas_units_per_swap
+            .or(file_config.avg_gas_units_per_swap)
+            .or(env::var("AVG_GAS_UNITS_PER_SWAP").ok().and_then(|s| s.parse().ok()));
+        let native_token_address = cli.native_token_address
+            .or(file_config.native_token_address)
+            .or(env::var("NATIVE_TOKEN_ADDRESS").ok())
+            .and_then(|s| Bytes::from_str(&s).ok());
         let max_hops = cli.max_hops
             .or(file_config.max_hops)
             .or(env::var("MAX_HOPS").ok().and_then(|s| s.parse().ok()));
@@ -170,6 +214,21 @@ impl AppConfig {
         let tokens_file = cli.tokens_file
             .or(file_config.tokens_file)
             .or(env::var("TOKENS_FILE").ok());
+        
+        // Load direct quote operation params
+        let sell_token_address = cli.sell_token
+            .or(file_config.sell_token_address)
+            .or(env::var("SELL_TOKEN").ok());
+        let buy_token_address = cli.buy_token
+            .or(file_config.buy_token_address)
+            .or(env::var("BUY_TOKEN").ok());
+        let sell_amount_value = cli.sell_amount
+            .or(file_config.sell_amount_value)
+            .or(env::var("SELL_AMOUNT").ok().and_then(|s| s.parse().ok()));
+        let display_numeraire_token_address = cli.display_numeraire_token
+            .or(file_config.display_numeraire_token_address)
+            .or(env::var("DISPLAY_NUMERAIRE_TOKEN").ok());
+
         Self {
             tycho_url,
             tycho_api_key,
@@ -177,10 +236,16 @@ impl AppConfig {
             tvl_threshold,
             rpc_url,
             gas_price_gwei,
+            avg_gas_units_per_swap,
+            native_token_address,
             max_hops,
             numeraire_token,
             probe_depth,
             tokens_file,
+            sell_token_address,
+            buy_token_address,
+            sell_amount_value,
+            display_numeraire_token_address,
         }
     }
 } 

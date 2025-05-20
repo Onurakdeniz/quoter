@@ -1,14 +1,19 @@
 // Library entry point for price-quoter
 
-pub mod component_tracker;
-pub mod graph;
-pub mod pathfinder;
-pub mod price_engine;
-pub mod cache;
+// pub mod component_tracker; // Moved to data_management
+// pub mod graph; // Moved to engine
+// pub mod pathfinder; // Moved to engine
+// pub mod price_engine; // Refactored into engine module
+// pub mod cache; // Moved to data_management
 pub mod config;
 pub mod types;
 pub mod utils;
-pub mod history;
+// pub mod history; // Moved to data_management
 
-#[cfg(feature = "api")]
-pub mod api; 
+pub mod engine;
+pub mod data_management;
+
+// #[cfg(feature = "api")]
+// pub mod api;  
+
+pub use tycho_simulation::tycho_common::Bytes;  

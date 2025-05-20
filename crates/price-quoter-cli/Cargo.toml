@@ -4,17 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-price-quoter = { path = "../price-quoter" }
-tokio = { version = "1.36", features = ["full"] }
-anyhow = "1.0"
+price-quoter = { path = "../price-quoter", features = ["cli"] }
 clap = { version = "4.4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-futures = "0.3"
-serde_json = "1.0"
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
 tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation.git", rev = "2ef64b9bcc20de865303efceb3a5d245c34b32c0" }
-hex = "0.4"
-chrono = "0.4"
-rustyline = "13"
-num-traits = "0.2"
+futures-util = "0.3" 
+rust_decimal = "1.37.1" 

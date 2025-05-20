@@ -1,28 +1,28 @@
-//! Pathfinding algorithms (Delta-stepping, Yen's K-Shortest Paths).
+//! Pathfinding algorithms (Delta-stepping, Yen\'s K-Shortest Paths).
 
-use crate::graph::TokenGraph;
-use petgraph::algo::{astar, dijkstra};
+use crate::engine::graph::TokenGraph; // Adjusted path
+use petgraph::algo::dijkstra;
 use petgraph::prelude::*;
 use petgraph::visit::EdgeRef;
 use tycho_simulation::tycho_common::Bytes;
 use tracing::debug;
-use crate::graph::csr::CsrGraph;
+use std::sync::{Arc, RwLock}; // Added imports
 
 /// Main pathfinding struct, operates on TokenGraph.
-pub struct Pathfinder<'a> {
-    pub graph: &'a TokenGraph,
+pub struct Pathfinder { // Removed lifetime 'a
+    pub graph: Arc<RwLock<TokenGraph>>, // Changed to Arc<RwLock<TokenGraph>>
 }
 
-impl<'a> Pathfinder<'a> {
-    pub fn new(graph: &'a TokenGraph) -> Self {
+impl Pathfinder { // Removed lifetime 'a
+    pub fn new(graph: Arc<RwLock<TokenGraph>>) -> Self { // Changed graph type
         Self { graph }
     }
 
     /// Find the best path (by weighted cost if available, else hops) from source to target token.
     pub fn best_path(&self, source: &Bytes, target: &Bytes) -> Option<Vec<NodeIndex>> {
-        // Fast path: if source == target return single-node path
+        let graph_r = self.graph.read().unwrap(); // Acquire read lock
         if source == target {
-            if let Some(&idx) = self.graph.token_indices.get(source) {
+            if let Some(&idx) = graph_r.token_indices.get(source) { // Use graph_r
                 return Some(vec![idx]);
             }
             return None;
@@ -31,9 +31,9 @@ impl<'a> Pathfinder<'a> {
         // If CSR edges exist (after recent update), prefer Δ-Stepping SSSP
         #[cfg(feature = "delta_sssp")]
         {
-            let csr = self.graph.to_csr();
-            let source_idx = *self.graph.token_indices.get(source)? as usize;
-            let target_idx = *self.graph.token_indices.get(target)? as usize;
+            let csr = graph_r.to_csr(); // Use graph_r
+            let source_idx = *graph_r.token_indices.get(source)? as usize; // Use graph_r
+            let target_idx = *graph_r.token_indices.get(target)? as usize; // Use graph_r
             let n = csr.indptr.len() - 1;
             let mut dist = vec![f32::INFINITY; n];
             let mut prev = vec![u32::MAX; n];
@@ -52,11 +52,11 @@ impl<'a> Pathfinder<'a> {
         }
 
         // --- Existing Dijkstra fallback ---
-        // Use Dijkstra's algorithm with edge weights if available
-        let source_idx = *self.graph.token_indices.get(source)?;
-        let target_idx = *self.graph.token_indices.get(target)?;
+        // Use Dijkstra\'s algorithm with edge weights if available
+        let source_idx = *graph_r.token_indices.get(source)?; // Use graph_r
+        let target_idx = *graph_r.token_indices.get(target)?; // Use graph_r
         let path_map = dijkstra(
-            &self.graph.graph,
+            &graph_r.graph, // Use graph_r
             source_idx,
             Some(target_idx),
             |e| e.weight().weight.unwrap_or(1.0),
@@ -65,7 +65,7 @@ impl<'a> Pathfinder<'a> {
             let mut path = vec![target_idx];
             let mut current = target_idx;
             while current != source_idx {
-                let pred = self.graph.graph
+                let pred = graph_r.graph // Use graph_r
                     .edges_directed(current, petgraph::Direction::Incoming)
                     .filter_map(|e| {
                         let n = e.source();
@@ -99,8 +99,9 @@ impl<'a> Pathfinder<'a> {
     /// NOTE: For production use a full Yen/K‑shortest implementation would be preferable, but
     /// this lightweight approach yields good routes while avoiding heavy dependencies.
     pub fn k_shortest_paths(&self, source: &Bytes, target: &Bytes, k: usize, max_depth: usize) -> Vec<Vec<NodeIndex>> {
+        let graph_r = self.graph.read().unwrap(); // Acquire read lock
         debug!(source = %hex::encode(source), target = %hex::encode(target), k=%k, max_depth=%max_depth, "Finding k-shortest paths");
-        let (source_idx, target_idx) = match (self.graph.token_indices.get(source), self.graph.token_indices.get(target)) {
+        let (source_idx, target_idx) = match (graph_r.token_indices.get(source), graph_r.token_indices.get(target)) {
             (Some(&s), Some(&t)) => (s, t),
             _ => {
                 debug!("Source or target token not found in graph indices");
@@ -123,7 +124,7 @@ impl<'a> Pathfinder<'a> {
 
             let last = *path.last().unwrap();
 
-            // If path already ends at target we're done – record and continue (do not expand further)
+            // If path already ends at target we\'re done – record and continue (do not expand further)
             if last == target_idx {
                 // Avoid adding duplicate paths to results
                 if visited_paths.insert(path.clone()) {
@@ -138,7 +139,7 @@ impl<'a> Pathfinder<'a> {
             }
 
             // Expand neighbours
-            for edge in self.graph.graph.edges(last) {
+            for edge in graph_r.graph.edges(last) {
                 let next = edge.target();
                 // Avoid cycles by skipping nodes already in path
                 if path.contains(&next) {
@@ -163,7 +164,7 @@ impl<'a> Pathfinder<'a> {
         debug!("Final top-k paths selected:");
         for (cost, path) in &results {
             let path_str = path.iter()
-                .map(|idx| self.graph.graph.node_weight(*idx).map_or("?".to_string(), |n| n.symbol.clone()))
+                .map(|idx| graph_r.graph.node_weight(*idx).map_or("?".to_string(), |n| n.symbol.clone()))
                 .collect::<Vec<_>>().join(" -> ");
             debug!(cost=%cost, path=%path_str);
         }
@@ -178,7 +179,8 @@ impl<'a> Pathfinder<'a> {
     /// NOTE: The number of returned paths can grow exponentially with depth, so callers should
     /// take care to keep `max_depth` small (typically 3‑4 for ERC‑20 routing).
     pub fn enumerate_paths(&self, source: &Bytes, target: &Bytes, max_depth: usize) -> Vec<Vec<NodeIndex>> {
-        let (source_idx, target_idx) = match (self.graph.token_indices.get(source), self.graph.token_indices.get(target)) {
+        let graph_r = self.graph.read().unwrap(); // Acquire read lock
+        let (source_idx, target_idx) = match (graph_r.token_indices.get(source), graph_r.token_indices.get(target)) {
             (Some(&s), Some(&t)) => (s, t),
             _ => return vec![],
         };
@@ -196,7 +198,7 @@ impl<'a> Pathfinder<'a> {
             if path.len() - 1 >= max_depth { // reached hop limit (edges)
                 continue;
             }
-            for edge in self.graph.graph.edges(last) {
+            for edge in graph_r.graph.edges(last) {
                 let next = edge.target();
                 if path.contains(&next) {
                     continue; // avoid cycles
@@ -212,12 +214,13 @@ impl<'a> Pathfinder<'a> {
 
     /// Compute the total cost of a path, considering slippage and fee if available.
     pub fn path_cost_with_slippage_fee(&self, path: &[NodeIndex]) -> Option<f64> {
+        let graph_r = self.graph.read().unwrap(); // Acquire read lock
         let mut total_cost = 0.0;
         for w in path.windows(2) {
             let from = w[0];
             let to = w[1];
             let mut edge_cost = None;
-            for edge in self.graph.graph.edges_connecting(from, to) {
+            for edge in graph_r.graph.edges_connecting(from, to) {
                 let ew = edge.weight();
                 // Use weight if available, else fallback to 1.0
                 edge_cost = Some(ew.weight.unwrap_or(1.0));
@@ -249,55 +252,96 @@ pub mod delta {
 
     const DEFAULT_DELTA: f32 = 1.0;
 
+    // Public SSSP function
     pub fn sssp_parallel(
         csr: &CsrGraph,
         source: usize,
-        _dirty_nodes: &[usize],
+        _dirty_nodes: &[usize], // Currently unused, for future incremental updates
         dist: &mut [f32],
         prev: &mut [u32],
     ) {
-        let n = dist.len();
+        let n = csr.indptr.len() - 1;
         dist.fill(f32::INFINITY);
-        prev.fill(u32::MAX);
+        prev.fill(u32::MAX); // Use u32::MAX to denote no predecessor
+
         dist[source] = 0.0;
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new()];
+        buckets[0].push(source);
+        let mut current_bucket_idx = 0;
 
-        let mut buckets: Vec<Vec<usize>> = vec![vec![source]];
-        let mut b = 0usize;
-        let delta = DEFAULT_DELTA;
-
-        while b < buckets.len() {
-            if buckets[b].is_empty() {
-                b += 1;
+        while current_bucket_idx < buckets.len() {
+            if buckets[current_bucket_idx].is_empty() {
+                current_bucket_idx += 1;
                 continue;
             }
-            let mut frontier = std::mem::take(&mut buckets[b]);
-            // Process light edges
-            let mut req: Vec<usize> = Vec::new();
-            while let Some(u) = frontier.pop() {
-                let du = dist[u];
-                for idx in csr.indptr[u]..csr.indptr[u + 1] {
-                    let v = csr.indices[idx] as usize;
-                    let w = csr.weights[idx];
-                    let alt = du + w;
-                    if alt < dist[v] {
-                        dist[v] = alt;
-                        prev[v] = u as u32;
-                        if w < delta {
-                            frontier.push(v);
-                        } else {
-                            let bi = (alt / delta).floor() as usize;
-                            if bi >= buckets.len() {
-                                buckets.resize_with(bi + 1, Vec::new);
-                            }
-                            buckets[bi].push(v);
+
+            let mut req: Vec<(usize, f32)> = Vec::new(); // Store (neighbor, weight)
+            let mut light_edges_nodes: Vec<usize> = Vec::new();
+            let mut heavy_edges_nodes: Vec<usize> = Vec::new();
+
+            // Phase 1: Relax light edges for nodes in current bucket
+            for &u in &buckets[current_bucket_idx] {
+                if dist[u] < (current_bucket_idx as f32 * DEFAULT_DELTA) { continue; } // Node already settled earlier
+
+                for i in csr.indptr[u]..csr.indptr[u + 1] {
+                    let v = csr.indices[i] as usize;
+                    let weight_uv = csr.weights[i];
+                    if weight_uv <= DEFAULT_DELTA { // Light edge
+                        if dist[u] + weight_uv < dist[v] {
+                            dist[v] = dist[u] + weight_uv;
+                            prev[v] = u as u32;
+                            req.push((v, dist[v]));
+                            light_edges_nodes.push(v);
+                        }
+                    } else { // Heavy edge
+                        if dist[u] + weight_uv < dist[v] {
+                            dist[v] = dist[u] + weight_uv;
+                            prev[v] = u as u32;
+                            req.push((v, dist[v])); // Keep track for potential re-bucketing
+                            heavy_edges_nodes.push(v); // For later processing
                         }
                     }
                 }
             }
-            // if frontier empty now, move to next bucket
-            if buckets[b].is_empty() {
-                b += 1;
+
+            buckets[current_bucket_idx].clear(); // Clear current bucket
+
+            // Re-bucket nodes relaxed by light edges
+            for node in light_edges_nodes {
+                let new_bucket_for_node = (dist[node] / DEFAULT_DELTA).floor() as usize;
+                if new_bucket_for_node >= buckets.len() {
+                    buckets.resize(new_bucket_for_node + 1, Vec::new());
+                }
+                if !buckets[new_bucket_for_node].contains(&node) { // Avoid duplicates
+                    buckets[new_bucket_for_node].push(node);
+                }
+            }
+
+            // Phase 2: Relax heavy edges (iteratively if needed, but simple version here)
+            // This part might need refinement for correctness with many heavy edges or specific graph structures.
+            // For now, we re-bucket nodes affected by heavy edges directly.
+            for node in heavy_edges_nodes {
+                let new_bucket_for_node = (dist[node] / DEFAULT_DELTA).floor() as usize;
+                 if new_bucket_for_node >= buckets.len() {
+                    buckets.resize(new_bucket_for_node + 1, Vec::new());
+                }
+                if !buckets[new_bucket_for_node].contains(&node) { // Avoid duplicates
+                     buckets[new_bucket_for_node].push(node);
+                }
+            }
+
+            // If no new nodes were added to current or future buckets, advance to next non-empty or finish.
+            let mut all_future_buckets_empty = true;
+            for b_idx in current_bucket_idx..buckets.len() {
+                if !buckets[b_idx].is_empty() {
+                    current_bucket_idx = b_idx;
+                    all_future_buckets_empty = false;
+                    break;
+                }
+            }
+            if all_future_buckets_empty {
+                break; // All done
             }
         }
     }
-}
+} 

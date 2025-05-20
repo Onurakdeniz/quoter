@@ -4,14 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Mutex};
 use tycho_simulation::{
     evm::{
-        engine_db::tycho_db::PreCachedDB,
         protocol::{
-            ekubo::state::EkuboState,
-            filters::{balancer_pool_filter, curve_pool_filter, uniswap_v4_pool_with_hook_filter},
             uniswap_v2::state::UniswapV2State,
             uniswap_v3::state::UniswapV3State,
-            uniswap_v4::state::UniswapV4State,
-            vm::state::EVMPoolState,
         },
         stream::ProtocolStreamBuilder,
     },
@@ -20,7 +15,6 @@ use tycho_simulation::{
     models::Token,
 };
 use tycho_simulation::tycho_common::models::Chain;
-use futures::Stream;
 use async_stream::stream;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -90,7 +84,7 @@ impl ComponentTracker {
             .exchange::<UniswapV3State>("uniswap_v3", tvl_filter.clone(), None);
 
         // Note: Additional protocols (Balancer, Curve, UniV4, etc.) currently disabled
-        // The remote Tycho Indexer API doesn't support these protocols
+        // The remote Tycho Indexer API doesn\'t support these protocols
         let mut protocol_stream = builder
             .auth_key(Some(api_key.to_string()))
             .skip_state_decode_failures(true)
