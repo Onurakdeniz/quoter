@@ -23,10 +23,23 @@ use petgraph::prelude::{NodeIndex, EdgeIndex};
 use petgraph::visit::EdgeRef;
 use std::str::FromStr;
 
+use rust_decimal::Decimal; // Ensure Decimal is imported if not already
 use futures::future::join_all; // For collecting async tasks
 use reqwest::Client; // Added for Infura calls
 use serde_json::{json, Value}; // Added for Infura calls
 use tracing::{info, warn}; // Added for logging
+
+/// Holds the results of a two-way price calculation.
+/// All prices are expressed as (target_token / numeraire_token).
+#[derive(Debug, Clone, Copy)]
+pub struct TwoWayPriceInfo {
+    /// The mean price, typically (forward + backward_normalized) / 2.
+    pub mean_price: Decimal,
+    /// Price from forward swap (numeraire -> target), expressed as target/numeraire.
+    pub price_forward: Decimal,
+    /// Price from backward swap (target -> numeraire), normalized to target/numeraire.
+    pub price_backward_normalized: Decimal,
+}
 
 // Default WETH address (mainnet)
 const DEFAULT_ETH_ADDRESS_STR: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
@@ -183,7 +196,7 @@ impl PriceEngine {
             let path_key = PathCacheKey {
                 sell_token: token_in.clone(),
                 buy_token: token_out.clone(),
-                block: 0, 
+                block: current_block, 
                 k: self.max_hops, 
             };
             let mut cache_w = self.cache.write().unwrap();
@@ -212,7 +225,7 @@ impl PriceEngine {
                     p.iter().filter_map(|idx| graph_r.graph.node_weight(*idx).map(|n| n.address.clone())).collect()
                 }).collect();
                 if !enumerated.is_empty() {
-                    let cached_value = CachedPaths { paths: addr_paths, block: 0, timestamp: Instant::now() };
+                    let cached_value = CachedPaths { paths: addr_paths, block: current_block, timestamp: Instant::now() };
                     cache_w.insert_paths(path_key, cached_value);
                 }
                 enumerated
@@ -278,25 +291,50 @@ impl PriceEngine {
 
         let best_path_details = sorted_paths[0].clone();
         
-        // Calculate mid_price based on the new two-way swap logic using engine's numeraire
-        let mid_price_of_token_in_vs_token_out = if *token_in == *token_out { // Deref Bytes for comparison
-            Some(Decimal::ONE)
-        } else {
-            let price_in_vs_n_fut = self.get_token_price(token_in, Some(current_block));
-            let price_out_vs_n_fut = self.get_token_price(token_out, Some(current_block));
-            let (price_in_vs_n, price_out_vs_n) = tokio::join!(price_in_vs_n_fut, price_out_vs_n_fut); // Await futures concurrently
+        // Calculate mid_price and spread_bps based on two-way price details
+        let engine_numeraire_address = self.numeraire_token.clone().unwrap_or_else(default_eth_address_bytes);
+        let mut mid_price_of_token_in_vs_token_out = None;
+        let mut quote_spread_bps: Option<Decimal> = None;
 
-            if let (Some(p_in), Some(p_out)) = (price_in_vs_n, price_out_vs_n) {
-                if !p_out.is_zero() {
-                    Some(p_in / p_out)
-                } else {
-                    None
-                }
-            } else {
-                None
+        if *token_in == *token_out {
+            mid_price_of_token_in_vs_token_out = Some(Decimal::ONE);
+            // Spread is arguably 0 if tokens are the same, or None if not meaningful.
+            // For now, let's assume if token_out is numeraire, it's 0.
+            if *token_out == engine_numeraire_address {
+                 quote_spread_bps = Some(Decimal::ZERO);
             }
-        };
+        } else {
+            let details_in_vs_n_fut = self.get_token_price_details(token_in, Some(current_block));
+            let details_out_vs_n_fut = self.get_token_price_details(token_out, Some(current_block));
+            let (details_in_vs_n_opt, details_out_vs_n_opt) = tokio::join!(details_in_vs_n_fut, details_out_vs_n_fut);
 
+            if let (Some(details_in), Some(details_out)) = (details_in_vs_n_opt, details_out_vs_n_opt) {
+                if !details_out.mean_price.is_zero() {
+                    mid_price_of_token_in_vs_token_out = Some(details_in.mean_price / details_out.mean_price);
+                }
+
+                // Calculate spread_bps for PriceQuote if token_out is the engine's numeraire
+                // This uses the two-way price details of token_in vs the numeraire.
+                if *token_out == engine_numeraire_address {
+                    quote_spread_bps = analytics::calculate_spread_bps_from_two_way_prices(
+                        details_in.price_forward,
+                        details_in.price_backward_normalized,
+                        details_in.mean_price,
+                    );
+                }
+                // If token_in is numeraire and token_out is something else, calculate spread for token_out vs numeraire.
+                // This is for cases like ETH -> TokenX, where spread of TokenX is of interest.
+                else if *token_in == engine_numeraire_address {
+                     quote_spread_bps = analytics::calculate_spread_bps_from_two_way_prices(
+                        details_out.price_forward,
+                        details_out.price_backward_normalized,
+                        details_out.mean_price,
+                    );
+                }
+                // Otherwise, quote_spread_bps remains None, as per current simplified logic.
+            }
+        }
+        
         let mut depth_metrics_map = HashMap::new();
 
         // Calculate depth metrics for the best path if numeraire is set
@@ -324,15 +362,15 @@ impl PriceEngine {
         PriceQuote {
             amount_out: best_path_details.amount_out,
             route: best_path_details.route.clone(),
-            price_impact_bps: best_path_details.price_impact_bps,
-            mid_price: mid_price_of_token_in_vs_token_out,
-            slippage_bps: best_path_details.slippage_bps,
-            fee_bps: best_path_details.fee_bps,
-            protocol_fee_in_token_out: best_path_details.protocol_fee_in_token_out,
-            gas_estimate: best_path_details.gas_estimate,
-            path_details: sorted_paths,
-            gross_amount_out: best_path_details.gross_amount_out,
-            spread_bps: best_path_details.spread_bps,
+            price_impact_bps: best_path_details.price_impact_bps, // From SinglePathQuote
+            mid_price: mid_price_of_token_in_vs_token_out, // Calculated above
+            slippage_bps: best_path_details.slippage_bps, // From SinglePathQuote
+            fee_bps: best_path_details.fee_bps, // From SinglePathQuote
+            protocol_fee_in_token_out: best_path_details.protocol_fee_in_token_out, // From SinglePathQuote
+            gas_estimate: best_path_details.gas_estimate, // From SinglePathQuote
+            path_details: sorted_paths, // Vec<SinglePathQuote>
+            gross_amount_out: best_path_details.gross_amount_out, // From SinglePathQuote
+            spread_bps: quote_spread_bps, // Calculated for PriceQuote based on numeraire relationship
             depth_metrics: if depth_metrics_map.is_empty() { None } else { Some(depth_metrics_map) },
             cache_block: None, // This is a fresh quote
         }
@@ -522,9 +560,13 @@ impl PriceEngine {
         path_nodes_target_to_numeraire: &[NodeIndex],
         path_edges_target_to_numeraire: &[EdgeIndex],
         block: Option<u64>,
-    ) -> Option<Decimal> {
+    ) -> Option<TwoWayPriceInfo> {
         if numeraire_token == target_token {
-            return Some(Decimal::ONE);
+            return Some(TwoWayPriceInfo {
+                mean_price: Decimal::ONE,
+                price_forward: Decimal::ONE,
+                price_backward_normalized: Decimal::ONE,
+            });
         }
         if probe_amount_of_numeraire == 0 {
             return None;
@@ -546,10 +588,10 @@ impl PriceEngine {
         let target_decimals = target_decimals_opt.unwrap();
 
         // 1. Forward Swap: numeraire_token -> target_token
-        let amount_target_out_option = simulation::simulate_path_gross(
+        let amount_target_out_option = simulation::simulate_path_gross( // Result is u128
             &self.tracker,
             &graph_r,
-            probe_amount_of_numeraire,
+            probe_amount_of_numeraire, // u128
             path_nodes_numeraire_to_target,
             path_edges_numeraire_to_target,
             block,
@@ -558,13 +600,26 @@ impl PriceEngine {
         if amount_target_out_option.is_none() || amount_target_out_option.unwrap() == 0 {
             return None;
         }
-        let amount_target_out = amount_target_out_option.unwrap();
+        let amount_target_out = amount_target_out_option.unwrap(); // u128
+
+        // Convert amounts to Decimal with correct scaling
+        let probe_amount_numeraire_dec = Decimal::from_i128_with_scale(probe_amount_of_numeraire as i128, numeraire_decimals as u32);
+        let amount_target_out_dec = Decimal::from_i128_with_scale(amount_target_out as i128, target_decimals as u32);
+
+        if probe_amount_numeraire_dec.is_zero() || amount_target_out_dec.is_zero() {
+            return None; // Avoid division by zero if initial amounts are zero
+        }
+
+        // Price from forward swap (target_token / numeraire_token)
+        // P_fwd = AmountTargetOut / AmountNumeraireIn
+        let price_forward = amount_target_out_dec / probe_amount_numeraire_dec;
 
         // 2. Backward Swap: amount_target_out (of target_token) -> numeraire_token
-        let amount_numeraire_returned_option = simulation::simulate_path_gross(
+        // We use amount_target_out (u128) as input for this simulation
+        let amount_numeraire_returned_option = simulation::simulate_path_gross( // Result is u128
             &self.tracker,
             &graph_r,
-            amount_target_out, // input for backward swap
+            amount_target_out, // u128, output from forward swap is input here
             path_nodes_target_to_numeraire,
             path_edges_target_to_numeraire,
             block,
@@ -573,37 +628,42 @@ impl PriceEngine {
         if amount_numeraire_returned_option.is_none() || amount_numeraire_returned_option.unwrap() == 0 {
             return None;
         }
-        let amount_numeraire_returned = amount_numeraire_returned_option.unwrap();
-
-        // Use Decimal::from_i128_with_scale for correct decimal handling
-        let probe_amount_numeraire_dec = Decimal::from_i128_with_scale(probe_amount_of_numeraire as i128, numeraire_decimals as u32);
-        let amount_target_out_dec = Decimal::from_i128_with_scale(amount_target_out as i128, target_decimals as u32);
+        let amount_numeraire_returned = amount_numeraire_returned_option.unwrap(); // u128
         let amount_numeraire_returned_dec = Decimal::from_i128_with_scale(amount_numeraire_returned as i128, numeraire_decimals as u32);
 
-        if probe_amount_numeraire_dec.is_zero() || amount_target_out_dec.is_zero() || amount_numeraire_returned_dec.is_zero() {
-            return None; // Avoid division by zero
+        if amount_numeraire_returned_dec.is_zero() {
+             return None; // Avoid division by zero if backward swap yields zero
         }
 
-        // Price from forward swap (target_token / numeraire_token)
-        let price_forward = amount_target_out_dec / probe_amount_numeraire_dec;
-
-        // Price from backward swap, normalized to (target_token / numeraire_token)
-        // Raw backward price: amount_numeraire_returned_dec / amount_target_out_dec (numeraire_token / target_token)
-        // Normalized: amount_target_out_dec / amount_numeraire_returned_dec (target_token / numeraire_token)
+        // Price from backward swap, needs to be normalized to (target_token / numeraire_token)
+        // Raw backward price: P_bwd_raw = AmountNumeraireReturned / AmountTargetIn (where AmountTargetIn was amount_target_out_dec)
+        // This is (numeraire_token / target_token).
+        // To normalize to (target_token / numeraire_token), we invert: 1 / P_bwd_raw
+        // P_bwd_norm = AmountTargetIn / AmountNumeraireReturned
         let price_backward_normalized = amount_target_out_dec / amount_numeraire_returned_dec;
 
         let mean_price = (price_forward + price_backward_normalized) / Decimal::new(2, 0);
-        Some(mean_price)
+        
+        Some(TwoWayPriceInfo {
+            mean_price,
+            price_forward,
+            price_backward_normalized,
+        })
     }
 
     /// Calculates the mid-price of a token in terms of the engine's configured numeraire (or ETH default).
     /// Uses a two-way swap with a configured probe depth.
-    pub async fn get_token_price(&self, token: &Bytes, block: Option<u64>) -> Option<Decimal> { // Made async
+    /// This is the internal method that returns full TwoWayPriceInfo.
+    async fn get_token_price_details(&self, token: &Bytes, block: Option<u64>) -> Option<TwoWayPriceInfo> {
         let engine_numeraire = self.numeraire_token.clone().unwrap_or_else(default_eth_address_bytes);
         let probe_amount = self.probe_depth.unwrap_or(DEFAULT_PROBE_DEPTH);
 
         if *token == engine_numeraire {
-            return Some(Decimal::ONE);
+            return Some(TwoWayPriceInfo {
+                mean_price: Decimal::ONE,
+                price_forward: Decimal::ONE,
+                price_backward_normalized: Decimal::ONE,
+            });
         }
 
         let path_n_to_t_nodes_opt = self.pathfinder.best_path(&engine_numeraire, token);
@@ -615,7 +675,6 @@ impl PriceEngine {
         let path_n_to_t_nodes = path_n_to_t_nodes_opt.unwrap();
         let path_t_to_n_nodes = path_t_to_n_nodes_opt.unwrap();
         
-        // Introduce a new scope to ensure graph_r is dropped before .await
         let (path_n_to_t_edges, path_t_to_n_edges) = {
             let graph_r = self.graph.read().unwrap();
             let path_n_to_t_edges_opt = graph_r.derive_edges_for_node_path(&path_n_to_t_nodes);
@@ -625,18 +684,23 @@ impl PriceEngine {
                 return None;
             }
             (path_n_to_t_edges_opt.unwrap(), path_t_to_n_edges_opt.unwrap())
-        }; // graph_r is dropped here
+        };
 
         self.calculate_token_price_in_numeraire_impl(
             token,              
             &engine_numeraire,  
             probe_amount,       
-            &path_n_to_t_nodes, // Pass as slice 
-            &path_n_to_t_edges, // Pass as slice
-            &path_t_to_n_nodes, // Pass as slice
-            &path_t_to_n_edges, // Pass as slice
+            &path_n_to_t_nodes, 
+            &path_n_to_t_edges, 
+            &path_t_to_n_nodes, 
+            &path_t_to_n_edges, 
             block,
         ).await
+    }
+
+    /// Public method that returns only the mean_price for compatibility.
+    pub async fn get_token_price(&self, token: &Bytes, block: Option<u64>) -> Option<Decimal> {
+        self.get_token_price_details(token, block).await.map(|info| info.mean_price)
     }
 
     async fn update_gas_price_from_infura(&self) -> Result<(), String> {
