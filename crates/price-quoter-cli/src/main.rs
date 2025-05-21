@@ -1,6 +1,7 @@
 use anyhow::Result;
 use price_quoter::config::AppConfig;
 use price_quoter::engine::{PriceEngine, graph::TokenGraph};
+use price_quoter::engine::quoting::PriceQuote;
 use price_quoter::data_management::component_tracker::ComponentTracker;
 use price_quoter::Bytes;
 use std::str::FromStr;
@@ -9,6 +10,7 @@ use price_quoter::data_management::cache::QuoteCache;
 use std::sync::{Arc, RwLock};
 // Use prelude for Decimal and common traits like FromPrimitive
 use rust_decimal::prelude::*;
+use env_logger;
 
 // Helper to get token symbol and decimals
 // Returns (Symbol, Decimals)
@@ -41,6 +43,7 @@ fn format_route_symbols(tracker: &ComponentTracker, route_bytes: &[Bytes]) -> St
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     // Load AppConfig using load_with_cli to respect CLI args, file, and env vars
     let config = AppConfig::load_with_cli(); 
 
@@ -127,7 +130,7 @@ async fn main() -> Result<()> {
                 println!("Quoting with updated graph ({} nodes, {} edges)...", node_count, edge_count);
 
                 // Call the quote function
-                let quote = engine.quote_multi(&sell_token_bytes, &buy_token_bytes, sell_amount_u128, 5, None);
+                let quote: PriceQuote = engine.quote_multi(&sell_token_bytes, &buy_token_bytes, sell_amount_u128, 5, None).await;
 
                 println!("\n--- Overall Best Quote Summary ---");
                 println!("Selling: {} {}", sell_amount_f64, sell_token_symbol);
@@ -172,6 +175,46 @@ async fn main() -> Result<()> {
                 quote.gas_estimate.map(|val| println!("Gas Estimate: {}", val));
                 quote.spread_bps.map(|val| println!("Spread (bps): {}", val));
                 quote.price_impact_bps.map(|val| println!("Price Impact (bps): {}", val));
+
+                // Display Gas Price (from config and engine)
+                if let Some(gas_gwei_cfg) = config.gas_price_gwei {
+                    println!("Gas Price (Config): {} Gwei", gas_gwei_cfg);
+                }
+                let current_gas_wei_engine = *engine.gas_price_wei.read().unwrap();
+                println!("Gas Price (Engine): {} Wei", current_gas_wei_engine);
+
+                // Display details from the best path (first in path_details)
+                if let Some(best_path) = quote.path_details.first() {
+                    if let Some(protocol_fee_val_raw_dec) = best_path.protocol_fee_in_token_out {
+                        // protocol_fee_val_raw_dec is a Decimal representing the raw amount in smallest units
+                        if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() { // Convert Decimal to u128 raw amount
+                           let formatted_protocol_fee = format_token_amount(protocol_fee_u128, buy_token_decimals);
+                           println!("Protocol Fee Amount: {} {}", formatted_protocol_fee, buy_token_symbol);
+                        } else {
+                            println!("Protocol Fee Amount: N/A (conversion error)");
+                        }
+                    }
+                    if let Some(gas_native_val) = best_path.gas_cost_native {
+                        // Assuming gas_native_val is scaled correctly to native token's decimals
+                        // We'd need native token symbol and decimals to format it properly
+                        // For now, print as decimal
+                        println!("Gas Cost (Native): {}", gas_native_val.round_dp(8)); // Potentially add native symbol
+                    }
+                    if let Some(gas_token_out_val) = best_path.gas_cost_in_token_out {
+                        println!("Gas Cost (Token Out): {} {}", gas_token_out_val.round_dp(6), buy_token_symbol);
+                    }
+                } else if quote.amount_out.is_some() { // Handle single path case (k=1) where path_details might be empty but other fields are populated directly on PriceQuote
+                    if let Some(protocol_fee_val_raw_dec) = quote.protocol_fee_in_token_out {
+                         if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() {
+                            let formatted_protocol_fee = format_token_amount(protocol_fee_u128, buy_token_decimals);
+                            println!("Protocol Fee Amount: {} {}", formatted_protocol_fee, buy_token_symbol);
+                         } else {
+                            println!("Protocol Fee Amount: N/A (conversion error)");
+                         }
+                    }
+                    // Similar for gas_cost_native and gas_cost_in_token_out if they were fields of PriceQuote
+                }
+
                 quote.cache_block.map(|val| println!("Cache Block: {}", val));
 
 
@@ -217,6 +260,24 @@ async fn main() -> Result<()> {
                          if let Some(gross_out_raw) = detail.gross_amount_out {
                             let formatted_gross_output = format_token_amount(gross_out_raw, path_output_decimals);
                             println!("    Gross Amount Out (Path Sim): {} {}", formatted_gross_output, path_output_symbol);
+                        }
+
+                        // Display per-path fee and gas details
+                        detail.fee_bps.map(|val| println!("    Fee (bps, Path): {}", val));
+                        if let Some(protocol_fee_val_raw_dec) = detail.protocol_fee_in_token_out {
+                            if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() {
+                                let formatted_protocol_fee = format_token_amount(protocol_fee_u128, path_output_decimals);
+                                println!("    Protocol Fee Amount (Path): {} {}", formatted_protocol_fee, path_output_symbol);
+                            } else {
+                                println!("    Protocol Fee Amount (Path): N/A (conversion error)");
+                            }
+                        }
+                        detail.gas_estimate.map(|val| println!("    Gas Estimate (Path): {}", val));
+                        if let Some(gas_native_val) = detail.gas_cost_native {
+                            println!("    Gas Cost (Native, Path): {}", gas_native_val.round_dp(8));
+                        }
+                        if let Some(gas_token_out_val) = detail.gas_cost_in_token_out {
+                            println!("    Gas Cost (Token Out, Path): {} {}", gas_token_out_val.round_dp(6), path_output_symbol);
                         }
 
                         if let Some(mid_price_path_raw) = detail.mid_price {

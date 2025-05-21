@@ -10,4 +10,5 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 tycho-simulation = { git = "https://github.com/propeller-heads/tycho-simulation.git", rev = "2ef64b9bcc20de865303efceb3a5d245c34b32c0" }
 futures-util = "0.3" 
-rust_decimal = "1.37.1" 
+rust_decimal = { workspace = true } 
+env_logger = "0.10" 

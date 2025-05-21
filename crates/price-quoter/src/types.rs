@@ -12,6 +12,7 @@ pub enum PriceQuoterError {
     PathfindingError(String),
     SimulationError(String),
     ConfigError(String),
+    IoError(String),
     Other(String),
 }
 
@@ -23,6 +24,7 @@ impl fmt::Display for PriceQuoterError {
             PriceQuoterError::PathfindingError(e) => write!(f, "Pathfinding error: {}", e),
             PriceQuoterError::SimulationError(e) => write!(f, "Simulation error: {}", e),
             PriceQuoterError::ConfigError(e) => write!(f, "Config error: {}", e),
+            PriceQuoterError::IoError(e) => write!(f, "I/O error: {}", e),
             PriceQuoterError::Other(e) => write!(f, "Other error: {}", e),
         }
     }

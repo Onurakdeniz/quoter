@@ -7,6 +7,7 @@ use petgraph::prelude::{NodeIndex, EdgeIndex};
 use crate::types::{QuoteRequest, QuoteResult, PriceQuoterError, Result as PriceQuoterResult};
 use crate::config::AppConfig;
 use std::str::FromStr; // Required for Bytes::from_str
+use std::io::BufRead; // Added back for reader.lines()
 
 // Constants for gas calculation
 const GWEI_TO_NATIVE_CONVERSION_FACTOR: f64 = 1e-9; // 1 Gwei = 10^-9 Native Token (e.g., ETH)
@@ -102,6 +103,7 @@ pub struct PriceQuote {
     pub mid_price: Option<Decimal>,
     pub slippage_bps: Option<Decimal>,
     pub fee_bps: Option<Decimal>,
+    pub protocol_fee_in_token_out: Option<Decimal>,
     pub gas_estimate: Option<u64>,
     pub path_details: Vec<SinglePathQuote>, // For multi-path
     pub gross_amount_out: Option<u128>,
@@ -120,6 +122,7 @@ pub struct SinglePathQuote {
     pub mid_price: Option<Decimal>,
     pub slippage_bps: Option<Decimal>,
     pub fee_bps: Option<Decimal>,
+    pub protocol_fee_in_token_out: Option<Decimal>,
     pub gas_estimate: Option<u64>,
     pub gross_amount_out: Option<u128>,
     pub spread_bps: Option<Decimal>,
@@ -129,8 +132,8 @@ pub struct SinglePathQuote {
     pub input_amount: Option<u128>,
     pub node_path: Vec<NodeIndex>,
     pub edge_seq: Vec<EdgeIndex>,
-    pub gas_cost_native: Option<Decimal>, // Added
-    pub gas_cost_in_token_out: Option<Decimal>, // Added
+    pub gas_cost_native: Option<Decimal>,
+    pub gas_cost_in_token_out: Option<Decimal>,
 }
 
 // Placeholder for PriceEngine methods that will be moved or called from here
@@ -144,6 +147,7 @@ pub fn invalid_path_quote(path: &[NodeIndex], edge_seq: &[EdgeIndex], amount_in:
         mid_price: None,
         slippage_bps: None,
         fee_bps: None,
+        protocol_fee_in_token_out: None,
         gas_estimate: None,
         gross_amount_out: None,
         spread_bps: None,
@@ -231,7 +235,7 @@ pub fn generate_quote_with_gas(
 ) -> PriceQuoterResult<QuoteResult> {
     // 1. Simulate the swap to get gross amount out and path
     // In a real system, this would involve pathfinding and detailed simulation.
-    let (gross_amount_out, path, total_fee, estimated_slippage) = simulate_swap_path_mock(
+    let (gross_amount_out, path, total_fee_from_sim, estimated_slippage) = simulate_swap_path_mock(
         &request.from_token,
         &request.to_token,
         request.amount_in,
@@ -262,15 +266,29 @@ pub fn generate_quote_with_gas(
         price_conversion_fn,
     );
 
-    // 5. Construct the final QuoteResult using the comprehensive details from gas_details
+    // 5. Calculate protocol fee amount
+    // Use protocol_fee_bps from AppConfig, defaulting to 0.0 if not set.
+    let protocol_fee_bps_value = config.protocol_fee_bps.unwrap_or(0.0);
+    let protocol_fee_amount = gross_amount_out * (protocol_fee_bps_value / 10000.0);
+
+    // 6. Calculate final net amount for QuoteResult
+    // This aligns "Receiving (Net)" with Gross Amount - Protocol Fee Amount.
+    let mut final_amount_out_net = gross_amount_out - protocol_fee_amount;
+    if final_amount_out_net < 0.0 {
+        final_amount_out_net = 0.0; // Ensure net amount is not negative
+    }
+
+    // 7. Construct the final QuoteResult
     Ok(QuoteResult {
         amount_out_gross: gross_amount_out,
         path,
-        total_fee, // This was from the mock simulation, representing DEX fees
-        estimated_slippage, // From mock simulation
+        total_fee: total_fee_from_sim, // Assumed to be DEX/LP fees from simulation
+        estimated_slippage,
         gas_cost_native: gas_details.gas_cost_native,
         gas_cost_token_out: gas_details.gas_cost_token_out,
-        amount_out_net: gas_details.net_amount_out, // Directly use net_amount_out from gas_details
+        amount_out_net: final_amount_out_net, // Corrected to be gross_amount_out - protocol_fee_amount
+        // Consider adding protocol_fee_amount to QuoteResult if it needs to be explicitly passed along.
+        // For example: protocol_fee: Some(protocol_fee_amount),
     })
 }
 
@@ -286,9 +304,7 @@ use crate::engine::PriceEngine; // Assuming PriceEngine is in crate::engine
 use std::sync::{Arc, RwLock, Mutex};
 use tokio_stream::StreamExt; // For updates.next().await
 use tracing::{info, error, warn};
-use rust_decimal::Decimal;
 use std::fs::{File, OpenOptions};
-use std::io::{Write, BufReader, BufRead};
 use std::collections::HashSet;
 
 
@@ -316,25 +332,22 @@ impl ContinuousPriceUpdater {
         price_engine: Arc<PriceEngine>,
         tracker: Arc<ComponentTracker>,
     ) -> PriceQuoterResult<Self> {
-        let global_numeraire = config.numeraire_token.clone().ok_or_else(|| {
-            PriceQuoterError::ConfigError(
-                "Global numeraire_token must be configured for ContinuousPriceUpdater.".to_string(),
-            )
-        })?;
+        let global_numeraire = config.numeraire_token.clone()
+            .ok_or_else(|| PriceQuoterError::ConfigError("Global numeraire token not set".to_string()))?;
 
-        let mut tokens_for_history = HashSet::new();
+        let mut tokens_for_history_set = HashSet::new();
         if let Some(tokens_file_path) = &config.tokens_file {
             info!("Loading tokens for price history from: {}", tokens_file_path);
             match File::open(tokens_file_path) {
                 Ok(file) => {
-                    let reader = BufReader::new(file);
+                    let reader = std::io::BufReader::new(file);
                     for line in reader.lines() {
                         match line {
                             Ok(addr_str) => {
                                 if addr_str.starts_with('#') || addr_str.trim().is_empty() { continue; }
                                 match Bytes::from_str(addr_str.trim()) {
                                     Ok(token_bytes) => {
-                                        tokens_for_history.insert(token_bytes);
+                                        tokens_for_history_set.insert(token_bytes);
                                     }
                                     Err(e) => {
                                         warn!("Failed to parse token address '{}' from tokens file for history: {}", addr_str, e);
@@ -352,148 +365,88 @@ impl ContinuousPriceUpdater {
                 }
             }
         }
-
-        let price_history_writer = if let Some(history_file_path) = &config.price_history_file {
-            let is_new_file = !std::path::Path::new(history_file_path).exists();
-            match OpenOptions::new().append(true).create(true).open(history_file_path) {
-                Ok(file) => {
-                    let mut writer = csv::Writer::from_writer(file);
-                    if is_new_file {
-                        info!("Price history file {} created. Writing header.", history_file_path);
-                        if let Err(e) = writer.write_record(&["block_number", "token_address", "price", "numeraire_address"]) {
-                            error!("Failed to write header to price history file {}: {}", history_file_path, e);
-                            None // Disable writer if header fails
-                        } else {
-                            if let Err(e) = writer.flush() {
-                                error!("Failed to flush header to price history file {}: {}", history_file_path, e);
-                            }
-                            Some(Arc::new(Mutex::new(writer)))
-                        }
-                    } else {
-                        info!("Appending to existing price history file: {}", history_file_path);
-                        Some(Arc::new(Mutex::new(writer)))
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to open or create price history file {}: {}. Price history will be disabled.", history_file_path, e);
-                    None
-                }
+        
+        let price_history_writer = if let Some(file_path_str) = &config.price_history_file {
+            if !file_path_str.is_empty() {
+                let file = OpenOptions::new().append(true).create(true).open(file_path_str)
+                    .map_err(|e| PriceQuoterError::IoError(format!("Failed to open price history file: {}", e)))?;
+                let writer = csv::WriterBuilder::new().has_headers(false).from_writer(file);
+                Some(Arc::new(Mutex::new(writer)))
+            } else {
+                None
             }
         } else {
             None
         };
 
-        if price_history_writer.is_some() {
-            if config.tokens_file.is_some() {
-                info!("Price history enabled. Logging specific tokens from: {:?}. Total: {}", config.tokens_file.as_ref().unwrap(), tokens_for_history.len());
-            } else {
-                info!("Price history enabled. Logging all calculated token prices to: {:?}", config.price_history_file.as_ref().unwrap());
-            }
-        } else {
-            info!("Price history saving is disabled.");
-        }
-        
         Ok(Self {
-            config: config.clone(), // Clone config for ownership if needed later, or ensure all uses are through Arc
+            config,
             price_cache,
             price_engine,
             tracker,
             global_numeraire,
-            tokens_for_history,
+            tokens_for_history: tokens_for_history_set,
             price_history_writer,
         })
     }
 
-    // Main loop for the updater
     pub async fn run(&self) {
-        info!(
-            "ContinuousPriceUpdater started. Numeraire: {:?}, Tycho URL: {:?}",
-            self.global_numeraire, self.config.tycho_rpc_url
+        if self.config.tycho_url.is_empty() {
+            warn!("Tycho URL not configured. ContinuousPriceUpdater will not run.");
+            return;
+        }
+
+        let updates_future = self.tracker.stream_updates(
+            self.config.tycho_url.as_str(),
+            self.config.chain.clone(),
+            self.config.tycho_api_key.as_str(),
+            self.config.tvl_threshold,
         );
 
-        let tycho_url = self.config.tycho_rpc_url.clone().unwrap_or_default();
-        let tycho_api_key = self.config.tycho_api_key.clone();
+        let mut updates = match updates_future.await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to establish update stream: {:?}", e);
+                return;
+            }
+        };
 
-        // Create the Tycho update stream
-        // stream_updates takes &self, so tracker needs to be Arc'd or PriceUpdater needs to own it.
-        // Assuming tracker is Arc<ComponentTracker> as passed in new()
-        let mut updates = self.tracker.stream_updates(
-            tycho_url,
-            self.config.chain.clone(), // Assuming AppConfig.chain is suitable
-            tycho_api_key,
-            Some(self.config.tvl_update_threshold_usd.unwrap_or(1000.0) as u64), // Example threshold
-        );
-
-        info!("Tycho update stream initiated.");
-
-        while let Some(block_update_result) = updates.next().await {
-            match block_update_result {
-                Ok(block_data) => {
-                    let block_for_this_update = block_data.block_number;
-                    info!("Received block update for block: {}", block_for_this_update);
-
-                    self.price_engine.update_graph_from_tracker_state();
-                    info!("PriceEngine graph updated for block: {}", block_for_this_update);
-                    
-                    let tokens_to_update = match self.price_engine.graph.read() { // Renamed for clarity
-                        Ok(graph_guard) => graph_guard.get_all_token_addresses(),
-                        Err(e) => {
-                            error!("Failed to get read lock on graph: {}. Skipping update for block {}", e, block_for_this_update); // Corrected variable name
-                            continue;
-                        }
-                    };
-
-                    if tokens_to_update.is_empty() {
-                        info!("No tokens found in the graph to update for block {}.", block_for_this_update);
-                        continue;
-                    }
-                    info!("Found {} tokens in graph to update prices for block {}.", tokens_to_update.len(), block_for_this_update);
-
-                    for token_addr in tokens_to_update {
-                        let price_option: Option<Decimal>;
-                        if token_addr == self.global_numeraire {
-                            price_option = Some(Decimal::ONE);
-                            // info!("Price for numeraire token {} (self-price) is 1.0", token_addr);
-                        } else {
-                            // PriceEngine's get_token_price uses its configured numeraire and probe depth
-                            price_option = self.price_engine.get_token_price(&token_addr, Some(block_for_this_update));
-                            // match price_option {
-                            //     Some(price) => info!("Calculated price for token {}: {} (vs numeraire {}) at block {}", token_addr, price, self.global_numeraire, block_for_this_update),
-                            //     None => warn!("Could not calculate price for token {} at block {}", token_addr, block_for_this_update),
-                            // }
-                        }
-
-                        let cached_price = CachedContinuousPrice {
-                            price: price_option,
-                            block: block_for_this_update,
+        info!("ContinuousPriceUpdater started. Listening for block updates...");
+        while let Some(block_update) = updates.next().await { // block_update is BlockUpdate
+            // No match needed if stream item is BlockUpdate directly
+            let current_block_for_update = block_update.block_number;
+            for token_addr in &self.tokens_for_history {
+                if token_addr != &self.global_numeraire {
+                    let price_option = self.price_engine.get_token_price(token_addr, Some(current_block_for_update)).await;
+                    if let Some(price) = price_option {
+                        let cached_price_data = CachedContinuousPrice {
+                            price: Some(price), // price is Decimal, so Some(price)
+                            block: current_block_for_update,
                         };
-                        
-                        match self.price_cache.write() {
-                            Ok(mut cache_guard) => {
-                                cache_guard.update_continuous_price(token_addr.clone(), cached_price.clone());
-                                if price_option.is_some() {
-                                   // info!("Updated price for token {}: {} at block {}", token_addr, price_option.unwrap(), block_for_this_update);
-                                } else {
-                                   // warn!("Stored None price for token {} at block {}", token_addr, block_for_this_update);
+                        self.price_cache.write().unwrap().update_continuous_price(
+                            token_addr.clone(),
+                            cached_price_data
+                        );
+                        if let Some(writer_arc) = &self.price_history_writer {
+                            let mut writer_guard = writer_arc.lock().unwrap();
+                            let timestamp = chrono::Utc::now().to_rfc3339();
+                            if let Err(e) = writer_guard.write_record(&[
+                                timestamp,
+                                format!("{:?}", token_addr),
+                                price.to_string(),
+                                current_block_for_update.to_string(),
+                            ]) {
+                                error!("Failed to write price history to CSV: {:?}", e);
+                            } else {
+                                 if let Err(e) = writer_guard.flush() {
+                                    error!("Failed to flush price history CSV: {:?}", e);
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to get write lock on price_cache for token {}: {}. Skipping cache update.", token_addr, e);
-                            }
                         }
                     }
-                    info!("Finished price updates for block: {}", block_for_this_update);
-                }
-                Err(e) => {
-                    error!("Error receiving block update from Tycho stream: {}", e);
-                    // Depending on the error, might need to decide whether to break or continue
                 }
             }
         }
-        warn!("Tycho update stream ended.");
+        warn!("ContinuousPriceUpdater stream ended.");
     }
-
-    // get_tokens_to_update, add_tracked_token, remove_tracked_token, list_tracked_tokens
-    // are now obsolete as we price all tokens from the graph.
-    // get_current_block is also obsolete as block number comes from Tycho.
 }

@@ -1,20 +1,17 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3_asyncio::tokio::future_into_py;
-
-use crate::config::AppConfig;
-use crate::engine::PriceEngine;
-use crate::data_management::component_tracker::ComponentTracker;
-use crate::engine::graph::TokenGraph;
-use crate::data_management::cache::QuoteCache;
-
-use tycho_simulation::tycho_common::{Bytes, models::Chain};
-use rust_decimal::Decimal;
+use tycho_simulation::tycho_common::Bytes;
 use std::sync::{Arc, RwLock};
 use std::str::FromStr;
 use tokio_stream::StreamExt; // For stream.next().await
 use crate::engine::quoting::{SinglePathQuote as RustSinglePathQuote, PriceQuote as RustPriceQuote}; // Alias Rust structs
 use std::collections::HashMap; // For PyPriceQuote.depth_metrics
+use crate::engine::PriceEngine; // Corrected path
+use crate::config::AppConfig;
+use crate::data_management::component_tracker::ComponentTracker;
+use crate::engine::graph::TokenGraph;
+use crate::data_management::cache::QuoteCache;
 
 // Python representation for SinglePathQuote
 #[pyclass(name = "SinglePathQuote")]
@@ -140,6 +137,7 @@ impl PyPriceQuoter {
         avg_gas_units_per_swap: Option<u64>,
         gas_price_gwei: Option<u64>,
         tvl_threshold: Option<f64>,
+        infura_api_key: Option<String>,
     ) -> PyResult<Self> {
         let config = AppConfig::for_python_bindings(
             tycho_url,
@@ -153,10 +151,11 @@ impl PyPriceQuoter {
             avg_gas_units_per_swap,
             gas_price_gwei,
             tvl_threshold,
-        )
-        .map_err(|e| PyValueError::new_err(format!("Failed to create AppConfig: {}", e)))?;
+            infura_api_key,
+            None, // protocol_fee_bps
+        ).map_err(|e| PyValueError::new_err(e))?;
 
-        let tracker = ComponentTracker::new(config.chain.clone(), Some(config.tvl_threshold as u64), None);
+        let tracker = ComponentTracker::new();
         let graph = Arc::new(RwLock::new(TokenGraph::new()));
         let cache = Arc::new(RwLock::new(QuoteCache::new()));
         
@@ -173,26 +172,25 @@ impl PyPriceQuoter {
         let initial_engine_ref = engine_arc.clone();
 
         rt.block_on(async {
-            let mut stream = initial_tracker_ref.stream_updates(
-                config.tycho_url.clone(), // Use URL from config
+            let updates_future = initial_tracker_ref.stream_updates(
+                config.tycho_url.as_str(),
                 config.chain.clone(), 
-                Some(config.tycho_api_key.clone()), // Use API key from config
-                Some(config.tvl_threshold as u64)
+                config.tycho_api_key.as_str(),
+                config.tvl_threshold
             );
-            // .await was removed from stream_updates as it returns the stream directly
             
-            if let Some(update_result) = stream.next().await {
-                 match update_result {
-                    Ok(_block_data) => {
-                        // Data is processed by the tracker internally when stream.next() is called.
-                        // Now, update the graph based on the tracker's current state.
-                        initial_engine_ref.update_graph_from_tracker_state();
-                        Ok(())
-                    }
-                    Err(e) => {
-                        Err(PyValueError::new_err(format!("Failed during initial data fetch: {}", e)))
-                    }
-                 }
+            let mut updates = match updates_future.await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    return Err(PyValueError::new_err(format!("Failed to establish update stream: {}", e)));
+                }
+            };
+            
+            if let Some(update_result_val) = updates.next().await { // update_result_val is BlockUpdate
+                // No match, use update_result_val directly as it's BlockUpdate
+                let _block_data = update_result_val;
+                initial_engine_ref.update_graph_from_tracker_state();
+                Ok(())
             } else {
                 Err(PyValueError::new_err("Failed to get any data from initial stream.".to_string()))
             }
@@ -212,10 +210,10 @@ impl PyPriceQuoter {
 
         future_into_py(py, async move {
             match engine.get_token_price(&token_bytes, None).await {
-                Some(price_decimal) => Ok(price_decimal.to_string()), 
-                None => Ok(Python::with_gil(|py| py.None())),
+                Some(price_decimal) => Ok(pyo3::Python::with_gil(|py| price_decimal.to_string().into_py(py))), 
+                None => Ok(pyo3::Python::with_gil(|py| py.None().into_py(py))) 
             }
-        })
+        }).map(|obj_ref| obj_ref.to_object(py)) // Convert &PyAny to PyObject
     }
 
     fn get_quote(
@@ -223,7 +221,7 @@ impl PyPriceQuoter {
         token_in_hex: String, 
         token_out_hex: String, 
         amount_in_str: String, 
-        k_paths: usize, 
+        k_paths: Option<usize>,
         py: Python
     ) -> PyResult<PyObject> {
         let engine = self.engine.clone();
@@ -233,14 +231,12 @@ impl PyPriceQuoter {
             .map_err(|e| PyValueError::new_err(format!("Invalid token_out_hex: {}", e)))?;
         let amount_in = amount_in_str.parse::<u128>()
             .map_err(|e| PyValueError::new_err(format!("Invalid amount_in_str: {}", e)))?;
+        let k = k_paths.unwrap_or(1);
 
         future_into_py(py, async move {
-            // Call the async quote_multi method
-            let rust_price_quote = engine.quote_multi(&token_in, &token_out, amount_in, k_paths, None).await;
-            // Convert to PyPriceQuote
-            let py_price_quote = PyPriceQuote::from(rust_price_quote);
-            Ok(py_price_quote)
-        })
+            let rust_price_quote = engine.quote_multi(&token_in, &token_out, amount_in, k, None).await;
+            Ok(PyPriceQuote::from(rust_price_quote)) // Keep as Rust pyclass type
+        }).map(|obj_ref| obj_ref.to_object(py)) // Convert &PyAny to PyObject
     }
 }
 

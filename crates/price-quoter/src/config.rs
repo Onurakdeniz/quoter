@@ -14,6 +14,7 @@ use clap::Parser;
 pub struct AppConfig {
     pub tycho_url: String,
     pub tycho_api_key: String,
+    pub infura_api_key: Option<String>,
     pub chain: Chain,
     pub tvl_threshold: f64,
     pub rpc_url: Option<String>,
@@ -29,12 +30,14 @@ pub struct AppConfig {
     pub sell_amount_value: Option<f64>,
     pub display_numeraire_token_address: Option<String>,
     pub price_history_file: Option<String>,
+    pub protocol_fee_bps: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct FileConfig {
     pub tycho_url: Option<String>,
     pub tycho_api_key: Option<String>,
+    pub infura_api_key: Option<String>,
     pub chain: Option<String>,
     pub tvl_threshold: Option<f64>,
     pub rpc_url: Option<String>,
@@ -49,6 +52,7 @@ pub struct FileConfig {
     pub buy_token_address: Option<String>,
     pub sell_amount_value: Option<f64>,
     pub display_numeraire_token_address: Option<String>,
+    pub protocol_fee_bps: Option<f64>,
 }
 
 #[cfg(feature = "cli")]
@@ -61,6 +65,8 @@ pub struct CliConfig {
     pub tycho_url: Option<String>,
     #[arg(long)]
     pub tycho_api_key: Option<String>,
+    #[arg(long)]
+    pub infura_api_key: Option<String>,
     #[arg(long)]
     pub chain: Option<String>,
     #[arg(long)]
@@ -91,6 +97,8 @@ pub struct CliConfig {
     pub display_numeraire_token: Option<String>,
     #[arg(long)]
     pub price_history_file: Option<String>,
+    #[arg(long)]
+    pub protocol_fee_bps: Option<f64>,
 }
 
 impl AppConfig {
@@ -120,10 +128,13 @@ impl AppConfig {
         let numeraire_token = env::var("NUMERAIRE_TOKEN").ok().and_then(|s| Bytes::from_str(&s).ok());
         let probe_depth = env::var("PROBE_DEPTH").ok().and_then(|s| s.parse().ok());
         let native_token_address = env::var("NATIVE_TOKEN_ADDRESS").ok().and_then(|s| Bytes::from_str(&s).ok());
+        let infura_api_key = env::var("INFURA_API_KEY").ok();
+        let protocol_fee_bps = env::var("PROTOCOL_FEE_BPS").ok().and_then(|s| s.parse().ok());
 
         Self {
             tycho_url,
             tycho_api_key,
+            infura_api_key,
             chain: chain_enum,
             tvl_threshold,
             rpc_url,
@@ -139,6 +150,7 @@ impl AppConfig {
             sell_amount_value: None,
             display_numeraire_token_address: None,
             price_history_file: env::var("PRICE_HISTORY_FILE").ok(),
+            protocol_fee_bps,
         }
     }
 
@@ -148,6 +160,7 @@ impl AppConfig {
         let mut file_config = FileConfig {
             tycho_url: None,
             tycho_api_key: None,
+            infura_api_key: None,
             chain: None,
             tvl_threshold: None,
             rpc_url: None,
@@ -162,7 +175,7 @@ impl AppConfig {
             sell_amount_value: None,
             display_numeraire_token_address: None,
             native_token_address: None,
-            price_history_file: None,
+            protocol_fee_bps: None,
         };
         if let Some(ref path) = cli.config {
             if let Ok(contents) = std::fs::read_to_string(path) {
@@ -206,6 +219,9 @@ impl AppConfig {
             .or(file_config.native_token_address)
             .or(env::var("NATIVE_TOKEN_ADDRESS").ok())
             .and_then(|s| Bytes::from_str(&s).ok());
+        let infura_api_key = cli.infura_api_key
+            .or(file_config.infura_api_key)
+            .or(env::var("INFURA_API_KEY").ok());
         let max_hops = cli.max_hops
             .or(file_config.max_hops)
             .or(env::var("MAX_HOPS").ok().and_then(|s| s.parse().ok()));
@@ -234,12 +250,15 @@ impl AppConfig {
             .or(file_config.display_numeraire_token_address)
             .or(env::var("DISPLAY_NUMERAIRE_TOKEN").ok());
         let price_history_file = cli.price_history_file
-            .or(file_config.price_history_file)
             .or(env::var("PRICE_HISTORY_FILE").ok());
+        let protocol_fee_bps = cli.protocol_fee_bps
+            .or(file_config.protocol_fee_bps)
+            .or(env::var("PROTOCOL_FEE_BPS").ok().and_then(|s| s.parse().ok()));
 
         Self {
             tycho_url,
             tycho_api_key,
+            infura_api_key,
             chain: chain_enum,
             tvl_threshold,
             rpc_url,
@@ -255,6 +274,7 @@ impl AppConfig {
             sell_amount_value,
             display_numeraire_token_address,
             price_history_file,
+            protocol_fee_bps,
         }
     }
 
@@ -271,6 +291,8 @@ impl AppConfig {
         avg_gas_units_per_swap: Option<u64>,
         gas_price_gwei: Option<u64>,
         tvl_threshold: Option<f64>,
+        infura_api_key: Option<String>,
+        protocol_fee_bps: Option<f64>,
         // tokens_file and price_history_file are omitted for Python bindings for now
         // as they are less likely to be configured this way.
     ) -> Result<Self, String> {
@@ -290,6 +312,7 @@ impl AppConfig {
         Ok(Self {
             tycho_url,
             tycho_api_key,
+            infura_api_key,
             chain: chain_enum,
             tvl_threshold: tvl_threshold.unwrap_or(100.0),
             rpc_url,
@@ -305,6 +328,7 @@ impl AppConfig {
             sell_amount_value: None, // Not relevant for general quoter init
             display_numeraire_token_address: None, // Not relevant for general quoter init
             price_history_file: None, // Not configured via Python for now
+            protocol_fee_bps,
         })
     }
 }

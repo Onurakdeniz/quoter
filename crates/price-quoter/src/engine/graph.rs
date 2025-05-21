@@ -14,6 +14,7 @@ use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use petgraph::prelude::NodeIndex;
 use petgraph::prelude::EdgeIndex;
+use log;
 
 /// Represents a token node in the graph.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,11 +179,30 @@ impl TokenGraph {
         }
         // Incrementally update directed edges for each pool (A->B, B->A for 2-token pools)
         for (pool_id, pool) in pools.iter() {
+            // !!! TEMPORARY WORKAROUND: Skip problematic pool causing panic in tycho-simulation !!!
+            if pool_id == "0x898adc9aa0c23dce3fed6456c34dbe2b57784325" {
+                log::warn!("Skipping problematic pool due to tycho-simulation panic: {}", pool_id);
+                continue;
+            }
+            // !!! END TEMPORARY WORKAROUND !!!
+
             let tokens = &pool.tokens;
             if tokens.len() < 2 { continue; }
             // pre-fetch pool_state once
             let pool_state = if let Some(ps) = pool_states.get(pool_id) { ps } else { continue };
-            let fee_default = match pool_state.fee() { f if f > 0.0 => Some(f), _ => Some(0.0025) };
+            
+            // Determine the fee for the edge
+            let mut fee_to_use_for_edge = match pool_state.fee() { 
+                f if f > 0.0 => Some(f), 
+                _ => Some(0.0025) // Default to 0.25% if pool_state.fee() is zero or negative
+            };
+
+            // !!! TEMPORARY TEST OVERRIDE FOR POOL 0xe0554a476a092703abdb3ef35c80e0d76d32939f !!!
+            if pool_id == "0xe0554a476a092703abdb3ef35c80e0d76d32939f" {
+                log::warn!("TEMPORARY OVERRIDE: Forcing fee for pool {} to 0.25% (0.0025)", pool_id);
+                fee_to_use_for_edge = Some(0.0025);
+            }
+            // !!! END TEMPORARY TEST OVERRIDE !!!
 
             for i in 0..tokens.len() {
                 for j in 0..tokens.len() {
@@ -194,27 +214,43 @@ impl TokenGraph {
                     };
 
                     // Build / update edge weight metadata fast helper fn
-                    let build_edge = |fee: Option<f64>| -> (Option<f64>, Option<(f64,f64)>) {
+                    let build_edge = |fee_decimal_opt: Option<f64>| -> (Option<f64>, Option<(f64,f64)>) { // Renamed param to avoid conflict
                         let mut weight=None; let mut reserves=None;
                         if let (Some(tok_in), Some(tok_out)) = (all_tokens.get(from_addr), all_tokens.get(to_addr)) {
-                            if let Some(f) = fee {
-                                weight = Self::compute_log_slippage_weight(pool_state, tok_in, tok_out, f);
+                            if let Some(f_decimal) = fee_decimal_opt { // Use the passed fee
+                                weight = Self::compute_log_slippage_weight(pool_state, tok_in, tok_out, f_decimal);
                             }
                             if weight.is_none() {
                                 if let Ok(spot)=pool_state.spot_price(tok_in, tok_out) { if spot>0.0 {
-                                    let eff = spot*(1.0-fee.unwrap_or(0.0025)); if eff>0.0 { weight=Some((-eff.ln()).abs()); }
+                                    let eff = spot*(1.0-fee_decimal_opt.unwrap_or(0.0025)); if eff>0.0 { weight=Some((-eff.ln()).abs()); }
                                 }}
                             }
                             if let (Ok(addr_in), Ok(addr_out)) = (Self::bytes_to_address(&tok_in.address), Self::bytes_to_address(&tok_out.address)) {
+                                log::info!(
+                                    "Attempting to get limits for pool: {}, token_in: {}, token_out: {}, protocol: {}",
+                                    pool_id,
+                                    tok_in.address,
+                                    tok_out.address,
+                                    pool.protocol_system
+                                );
+                                // Also log pool_state details if possible, e.g., type or specific fields if accessible
+                                // For example, if pool_state has a method to describe itself:
+                                // log::info!("Pool state details: {:?}");
+
                                 if let Ok((max_in, max_out)) = pool_state.get_limits(addr_in, addr_out) {
                                     reserves = Some((max_in.to_f64().unwrap_or(0.0), max_out.to_f64().unwrap_or(0.0)));
+                                } else {
+                                    log::warn!(
+                                        "Failed to get limits for pool: {}, token_in: {}, token_out: {}",
+                                        pool_id, tok_in.address, tok_out.address
+                                    );
                                 }
                             }
                         }
                         (weight,reserves)
                     };
 
-                    let (weight,reserves) = build_edge(fee_default);
+                    let (weight,reserves) = build_edge(fee_to_use_for_edge); // Pass the determined fee
 
                     // Check if an edge for this pool already exists
                     let existing_edge_idx = self.graph
@@ -224,21 +260,24 @@ impl TokenGraph {
 
                     match existing_edge_idx {
                         Some(eidx) => {
-                            if let Some(edge_w) = self.graph.edge_weight_mut(eidx) {
-                                edge_w.fee = fee_default;
-                                edge_w.weight = weight;
-                                edge_w.reserves = reserves;
+                            // Update existing edge
+                            if let Some(edge_mut) = self.graph.edge_weight_mut(eidx) {
+                                edge_mut.protocol = pool.protocol_system.clone();
+                                edge_mut.fee = fee_to_use_for_edge; // Update fee
+                                edge_mut.weight = weight;
+                                edge_mut.reserves = reserves;
                             }
                         }
                         None => {
-                            let edge = PoolEdge {
+                            // Add new edge
+                            let new_edge = PoolEdge {
                                 pool_id: pool_id.clone(),
                                 protocol: pool.protocol_system.clone(),
-                                fee: fee_default,
+                                fee: fee_to_use_for_edge, // Set fee
                                 weight,
                                 reserves,
                             };
-                            self.graph.add_edge(from_idx, to_idx, edge);
+                            self.graph.add_edge(from_idx, to_idx, new_edge);
                         }
                     }
                 }

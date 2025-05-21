@@ -1,11 +1,13 @@
 //! Path simulation logic.
 
-use tycho_simulation::protocol::state::ProtocolSim;
+// use tycho_simulation::protocol::state::ProtocolSim; // This was the original unused import to remove
+use crate::data_management::component_tracker::ComponentTracker;
+use crate::engine::graph::TokenGraph;
+// use tycho_simulation::models::Token; // Unused
+// use tycho_simulation::tycho_common::Bytes; // Unused
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use petgraph::prelude::{NodeIndex, EdgeIndex};
-use crate::engine::graph::TokenGraph;
-use crate::data_management::component_tracker::ComponentTracker;
 
 // Placeholder for simulate_path_gross and other simulation-related functions
 // from the original price_engine.rs file.
@@ -18,7 +20,7 @@ pub fn simulate_path_gross(
     amount_in: u128,
     path_nodes: &[NodeIndex],
     path_edges: &[EdgeIndex],
-    block: Option<u64>, // Add block parameter
+    _block: Option<u64>, // Add block parameter, prefixed with underscore as unused
 ) -> Option<u128> {
     if path_nodes.len() < 2 || path_edges.len() != path_nodes.len() - 1 {
         return None; // Invalid path

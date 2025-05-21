@@ -62,10 +62,10 @@ pub fn calculate_spread_bps(
 
 // Simplified find_depth_for_slippage. Full version later.
 pub fn find_depth_for_slippage(
-    tracker: &ComponentTracker,
-    graph: &TokenGraph,
-    token_in: &Bytes,
-    token_out: &Bytes,
+    _tracker: &ComponentTracker,
+    _graph: &TokenGraph,
+    _token_in: &Bytes,
+    _token_out: &Bytes,
     mid_price: Decimal, // The reference mid-price for the best path
     path_nodes: &[NodeIndex],
     path_edges: &[EdgeIndex],
@@ -91,8 +91,8 @@ pub fn find_depth_for_slippage(
         if test_amount_in == 0 { low = 1; continue;}
 
         let gross_amount_out_opt = simulation::simulate_path_gross(
-            tracker,
-            graph,
+            _tracker,
+            _graph,
             test_amount_in,
             path_nodes,
             path_edges,

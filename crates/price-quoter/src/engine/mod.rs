@@ -21,10 +21,12 @@ use std::time::Instant;
 use itertools::Itertools;
 use petgraph::prelude::{NodeIndex, EdgeIndex};
 use petgraph::visit::EdgeRef;
-use rayon::prelude::*;
 use std::str::FromStr;
 
 use futures::future::join_all; // For collecting async tasks
+use reqwest::Client; // Added for Infura calls
+use serde_json::{json, Value}; // Added for Infura calls
+use tracing::{info, warn}; // Added for logging
 
 // Default WETH address (mainnet)
 const DEFAULT_ETH_ADDRESS_STR: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
@@ -49,6 +51,7 @@ pub struct PriceEngine {
     pub probe_depth: Option<u128>,
     pub native_token_address: Bytes, // Added
     pub avg_gas_units_per_swap: u64, // Added, no longer Option
+    pub infura_api_key: Option<String>, // Added Infura API Key
 }
 
 impl PriceEngine {
@@ -68,6 +71,7 @@ impl PriceEngine {
             probe_depth: None,
             native_token_address: default_eth_address_bytes(), // Default native token
             avg_gas_units_per_swap: DEFAULT_AVG_GAS_UNITS_PER_SWAP, // Default gas units
+            infura_api_key: None, // Initialize as None
         }
     }
 
@@ -87,6 +91,7 @@ impl PriceEngine {
             probe_depth: None,
             native_token_address: default_eth_address_bytes(), // Default native token
             avg_gas_units_per_swap: DEFAULT_AVG_GAS_UNITS_PER_SWAP, // Default gas units
+            infura_api_key: None, // Initialize as None
         }
     }
     
@@ -102,6 +107,7 @@ impl PriceEngine {
 
         let native_token_address = config.native_token_address.clone().unwrap_or_else(default_eth_address_bytes);
         let avg_gas_units_per_swap = config.avg_gas_units_per_swap.unwrap_or(DEFAULT_AVG_GAS_UNITS_PER_SWAP);
+        let infura_api_key = config.infura_api_key.clone(); // Get Infura API key from config
 
         Self {
             tracker,
@@ -114,6 +120,7 @@ impl PriceEngine {
             probe_depth,
             native_token_address,
             avg_gas_units_per_swap,
+            infura_api_key, // Store Infura API key
         }
     }
 
@@ -131,6 +138,7 @@ impl PriceEngine {
                 mid_price: cached.mid_price,
                 slippage_bps: cached.slippage_bps,
                 fee_bps: cached.fee_bps,
+                protocol_fee_in_token_out: None,
                 gas_estimate: cached.gas_estimate,
                 path_details: Vec::new(),
                 gross_amount_out: cached.gross_amount_out,
@@ -163,6 +171,11 @@ impl PriceEngine {
 
     /// Compute a price quote for a given input token, output token, and amount, simulating up to K paths.
     pub async fn quote_multi(&self, token_in: &Bytes, token_out: &Bytes, amount_in: u128, k: usize, block: Option<u64>) -> PriceQuote { // Made async
+        // Attempt to update gas price from Infura
+        if let Err(e) = self.update_gas_price_from_infura().await {
+            warn!("Failed to update gas price from Infura, proceeding with current/default: {}", e);
+        }
+
         let current_block = block.unwrap_or(0);
         
         let all_paths_nodes: Vec<Vec<NodeIndex>> = {
@@ -256,12 +269,11 @@ impl PriceEngine {
         
         // Sort by net amount_out descending
         let mut sorted_paths = evaluated_paths_results; // Use the collected results
-        let mut sorted_paths = evaluated_paths;
         sorted_paths.sort_by(|a, b| b.amount_out.cmp(&a.amount_out));
         sorted_paths.truncate(k);
 
         if sorted_paths.is_empty() {
-            return PriceQuote { amount_out: None, route: vec![], price_impact_bps: None, mid_price: None, slippage_bps: None, fee_bps: None, gas_estimate: None, path_details: vec![], gross_amount_out: None, spread_bps: None, depth_metrics: None, cache_block: None };
+            return PriceQuote { amount_out: None, route: vec![], price_impact_bps: None, mid_price: None, slippage_bps: None, fee_bps: None, protocol_fee_in_token_out: None, gas_estimate: None, path_details: vec![], gross_amount_out: None, spread_bps: None, depth_metrics: None, cache_block: None };
         }
 
         let best_path_details = sorted_paths[0].clone();
@@ -316,6 +328,7 @@ impl PriceEngine {
             mid_price: mid_price_of_token_in_vs_token_out,
             slippage_bps: best_path_details.slippage_bps,
             fee_bps: best_path_details.fee_bps,
+            protocol_fee_in_token_out: best_path_details.protocol_fee_in_token_out,
             gas_estimate: best_path_details.gas_estimate,
             path_details: sorted_paths,
             gross_amount_out: best_path_details.gross_amount_out,
@@ -333,19 +346,38 @@ impl PriceEngine {
     // For now, it stays here to ensure `quote_multi` compiles.
     // Made async because it calls async self.get_token_price
     pub async fn quote_single_path_with_edges(&self, token_in: Bytes, token_out: Bytes, amount_in: u128, path: Vec<NodeIndex>, edge_seq: Vec<EdgeIndex>, block: Option<u64>) -> SinglePathQuote {
-        // Note: token_in, token_out, path, edge_seq are now owned params due to async context.
-        let graph_r = self.graph.read().unwrap(); // This lock needs to be managed carefully in async.
-                                                 // If held across .await, it can cause deadlocks or contention.
-                                                 // For now, assume it's short-lived.
-        let gross_amount_out = simulation::simulate_path_gross(&self.tracker, &graph_r, amount_in, &path, &edge_seq, block);
+        let gross_amount_out_val: u128;
+        let route_addresses: Vec<Bytes>;
+        let pool_ids_for_path: Vec<String>;
+        let mut total_protocol_fee_bps = Decimal::ZERO;
+        // let path_protocol_fees_bps: Vec<(String, Decimal)> = Vec::new(); // This can be computed inside the scope too
 
-        if gross_amount_out.is_none() {
-            return quoting::invalid_path_quote(path, edge_seq, amount_in);
+        {
+            let graph_r = self.graph.read().unwrap();
+            let gross_opt = simulation::simulate_path_gross(&self.tracker, &graph_r, amount_in, &path, &edge_seq, block);
+            if gross_opt.is_none() {
+                // To return early, we need to construct a SinglePathQuote. Since graph_r is available here,
+                // we can call invalid_path_quote which takes slices.
+                return quoting::invalid_path_quote(&path, &edge_seq, amount_in);
+            }
+            gross_amount_out_val = gross_opt.unwrap();
+
+            route_addresses = path.iter().map(|idx| graph_r.graph.node_weight(*idx).expect("Node weight not found").address.clone()).collect();
+            pool_ids_for_path = edge_seq.iter().map(|e_idx| graph_r.graph.edge_weight(*e_idx).expect("Edge weight not found").pool_id.clone()).collect();
+
+            for edge_idx in edge_seq.iter() {
+                if let Some(pool_edge) = graph_r.graph.edge_weight(*edge_idx) { 
+                    let fee_percent = pool_edge.fee; 
+                    let fee_decimal_factor = Decimal::from_f64_retain(fee_percent.unwrap_or(0.0)).unwrap_or_default();
+                    let fee_bps_for_edge = fee_decimal_factor * Decimal::new(10000, 0);
+                    total_protocol_fee_bps += fee_bps_for_edge;
+                    // path_protocol_fees_bps.push((pool_edge.pool_id.clone(), fee_bps_for_edge)); // If needed outside
+                }
+            }
+            // graph_r is dropped here
         }
-        let gross_amount_out_val = gross_amount_out.unwrap();
-        let current_block_num = block.unwrap_or(0); // For get_token_price calls
-
-        // --- Gas Calculation Start ---
+        
+        let current_block_num = block.unwrap_or(0);
         let gas_estimate_units = edge_seq.len() as u64 * self.avg_gas_units_per_swap;
         
         let native_token_decimals = self.tracker.all_tokens.read().unwrap()
@@ -354,78 +386,71 @@ impl PriceEngine {
 
         let current_gas_price_wei_val = *self.gas_price_wei.read().unwrap();
         let gas_cost_in_native_token_units = gas_estimate_units as u128 * current_gas_price_wei_val;
-        
         let gas_cost_native_decimal = Decimal::from_i128_with_scale(gas_cost_in_native_token_units as i128, native_token_decimals);
-        
         let mut gas_cost_in_token_out_decimal = Decimal::ZERO;
 
-        if token_out == self.native_token_address { // Deref not needed due to owned Bytes
+        if token_out == self.native_token_address { 
             gas_cost_in_token_out_decimal = gas_cost_native_decimal;
         } else {
-            // Await the get_token_price calls
             let price_native_vs_numeraire_fut = self.get_token_price(&self.native_token_address, Some(current_block_num));
-            let price_out_vs_numeraire_fut = self.get_token_price(&token_out, Some(current_block_num)); // Use owned token_out
+            let price_out_vs_numeraire_fut = self.get_token_price(&token_out, Some(current_block_num)); 
             let (price_native_vs_numeraire, price_out_vs_numeraire) = tokio::join!(price_native_vs_numeraire_fut, price_out_vs_numeraire_fut);
 
-
             if let (Some(p_native), Some(p_out)) = (price_native_vs_numeraire, price_out_vs_numeraire) {
-                if !p_out.is_zero() {
-                    let price_of_native_in_terms_of_token_out = p_native / p_out;
-                    gas_cost_in_token_out_decimal = gas_cost_native_decimal * price_of_native_in_terms_of_token_out;
-                } else {
-                    // Price of output token is zero, cannot convert gas cost. Log or handle as error.
-                    // For now, gas_cost_in_token_out_decimal remains zero.
+                if !p_out.is_zero() && !p_native.is_zero() {
+                    let price_of_out_per_native = p_out / p_native;
+                    gas_cost_in_token_out_decimal = gas_cost_native_decimal * price_of_out_per_native;
+                } else if !p_out.is_zero() && p_native.is_zero() && gas_cost_native_decimal.is_zero() {
+                    gas_cost_in_token_out_decimal = Decimal::ZERO;
+                } else if p_native.is_zero() && !gas_cost_native_decimal.is_zero() {
+                    warn!("Native token price is zero, but gas cost in native is non-zero. Cannot convert gas cost to token_out.");
                 }
-            } else {
-                // Could not get prices for conversion. Log or handle.
-                // For now, gas_cost_in_token_out_decimal remains zero.
             }
         }
-        // --- Gas Calculation End ---
 
-        let amount_in_dec = Decimal::from(amount_in);
-        let gross_amount_out_dec = Decimal::from(gross_amount_out_val);
-        
-        let token_in_model = self.tracker.all_tokens.read().unwrap().get(&token_in).cloned(); // Use owned token_in
-        let token_out_model = self.tracker.all_tokens.read().unwrap().get(&token_out).cloned(); // Use owned token_out
+        // Determine decimals for token_in and token_out to create correctly scaled Decimals
+        let token_in_decimals = self.tracker.all_tokens.read().unwrap()
+            .get(&token_in)
+            .map(|t| t.decimals as u32)
+            .unwrap_or(18u32);
+        let token_out_decimals = self.tracker.all_tokens.read().unwrap()
+            .get(&token_out)
+            .map(|t| t.decimals as u32)
+            .unwrap_or(18u32);
 
-        if token_in_model.is_none() || token_out_model.is_none() {
-             return quoting::invalid_path_quote(&path, &edge_seq, amount_in); // Pass slices
-        }
-        let _t_in = token_in_model.unwrap(); 
-        let _t_out = token_out_model.unwrap(); // No longer t_out, use _t_out for consistency
+        // Convert integer (raw base-unit) amounts to Decimal **with the proper scale**
+        let amount_in_dec   = Decimal::from_i128_with_scale(amount_in as i128,   token_in_decimals);
+        let gross_amount_out_dec = Decimal::from_i128_with_scale(gross_amount_out_val as i128, token_out_decimals);
 
-        // Calculate total protocol fee in BPS and as a Decimal amount
-        let mut total_protocol_fee_bps = Decimal::ZERO;
-        let mut path_protocol_fees_bps: Vec<(String, Decimal)> = Vec::new();
+        // Ensure gas_cost_in_token_out_decimal is also expressed with the SAME scale as token_out_decimals
+        gas_cost_in_token_out_decimal.rescale(token_out_decimals);
 
-        for edge_idx in edge_seq.iter() {
-            if let Some(pool_edge) = graph_r.graph.edge_weight(*edge_idx) { // Now pool_edge is &PoolEdge
-                // Assuming all edges in the path are PoolEdges for protocol fee calculation.
-                // If VirtualEdges or other types exist and need different handling for fees,
-                // this logic would need to be adapted, perhaps by inspecting pool_edge.protocol or similar.
-                let fee_percent = pool_edge.fee; // This is Option<f64> from PoolEdge
-                // Convert f64 to Decimal. fee_percent is a direct factor (e.g., 0.003 for 0.3%)
-                let fee_decimal_factor = Decimal::from_f64_retain(fee_percent.unwrap_or(0.0)).unwrap_or_default();
-                let fee_bps_for_edge = fee_decimal_factor * Decimal::new(10000, 0); // Convert factor to BPS
-                total_protocol_fee_bps += fee_bps_for_edge;
-                path_protocol_fees_bps.push((pool_edge.pool_id.clone(), fee_bps_for_edge));
-            }
-        }
-        
+        // ------------------------------------------------------------------
+        // Fee & Net amount calculations (now all on the same scale)
+        // ------------------------------------------------------------------
         let protocol_fee_amount_dec = if !total_protocol_fee_bps.is_zero() && !gross_amount_out_dec.is_zero() {
             gross_amount_out_dec * (total_protocol_fee_bps / Decimal::new(10000, 0))
         } else {
             Decimal::ZERO
         };
 
-        // Use the new gas_cost_in_token_out_decimal
-        let net_amount_out_dec = gross_amount_out_dec - protocol_fee_amount_dec - gas_cost_in_token_out_decimal;
-        let net_amount_out_dec = net_amount_out_dec.max(Decimal::ZERO); // Ensure not negative
+        let net_amount_out_dec = (gross_amount_out_dec - protocol_fee_amount_dec - gas_cost_in_token_out_decimal).max(Decimal::ZERO);
+        
+        // Convert the final net_amount_out_dec (which is correctly scaled to token_out_decimals)
+        // back to a u128 integer representing the smallest unit of the token.
+        // The mantissa gives the integer value if the decimal point were removed.
+        let net_amount_out = if net_amount_out_dec.is_zero() {
+            0u128
+        } else {
+            // Ensure the scale of net_amount_out_dec is indeed token_out_decimals before taking mantissa
+            // This should already be true due to prior calculations.
+            // If net_amount_out_dec was 123.45 (USDC, 6 decimals), its mantissa would be 123450000.
+            net_amount_out_dec.mantissa().abs().to_u128().unwrap_or(0)
+        };
 
-        let net_amount_out = net_amount_out_dec.to_u128().unwrap_or(0);
-
-        // Mid price for this specific path simulation (effective price before fees and gas)
+        // Also store gross in raw units if needed (already is)
+        // ------------------------------------------------------------------
+        // Re-compute mid prices/slippage with correctly scaled Decimals
         let mid_price_approx_gross = if !amount_in_dec.is_zero() && !gross_amount_out_dec.is_zero() {
             Some(gross_amount_out_dec / amount_in_dec)
         } else {
@@ -433,35 +458,31 @@ impl PriceEngine {
         };
 
         let price_impact = mid_price_approx_gross.and_then(|mp| analytics::calculate_price_impact_bps(amount_in_dec, gross_amount_out_dec, mp));
-        // Slippage and spread should be calculated on net_amount_out_dec if they are meant to reflect the final price after all costs.
-        // Or, if they are about the pool's performance before external costs, gross_amount_out_dec might be used for some.
-        // For now, let's assume slippage and spread are about the final net price.
+
         let mid_price_approx_net = if !amount_in_dec.is_zero() && !net_amount_out_dec.is_zero() {
             Some(net_amount_out_dec / amount_in_dec)
         } else {
             None
         };
-
         let slippage = mid_price_approx_net.and_then(|mp| analytics::calculate_slippage_bps(amount_in_dec, net_amount_out_dec, mp));
         let spread = mid_price_approx_net.and_then(|mp| analytics::calculate_spread_bps(amount_in_dec, net_amount_out_dec, mp));
-        
-        // This was previously `fee_bps_final`. If this represents the total protocol fee, it's `total_protocol_fee_bps`
         let fee_bps_for_quote = Some(total_protocol_fee_bps);
 
         SinglePathQuote {
             amount_out: Some(net_amount_out),
-            route: path.iter().map(|idx| graph_r.graph.node_weight(*idx).unwrap().address.clone()).collect(), // path is Vec
+            route: route_addresses, // Use extracted data
             mid_price: mid_price_approx_net, 
             slippage_bps: slippage,
             fee_bps: fee_bps_for_quote, 
-            gas_estimate: Some(gas_estimate_units), // Use the calculated gas units
+            protocol_fee_in_token_out: Some(protocol_fee_amount_dec),
+            gas_estimate: Some(gas_estimate_units),
             gross_amount_out: Some(gross_amount_out_val),
             spread_bps: spread,
             price_impact_bps: price_impact, 
-            pools: edge_seq.iter().map(|e_idx| graph_r.graph.edge_weight(*e_idx).unwrap().pool_id.clone()).collect(), // edge_seq is Vec
+            pools: pool_ids_for_path, // Use extracted data
             input_amount: Some(amount_in),
-            node_path: path, // path is now owned Vec
-            edge_seq: edge_seq, // edge_seq is now owned Vec
+            node_path: path, 
+            edge_seq: edge_seq, 
             gas_cost_native: Some(gas_cost_native_decimal), 
             gas_cost_in_token_out: Some(gas_cost_in_token_out_decimal), 
         }
@@ -573,7 +594,6 @@ impl PriceEngine {
             return Some(Decimal::ONE);
         }
 
-        // Pathfinder methods will acquire their own locks internally.
         let path_n_to_t_nodes_opt = self.pathfinder.best_path(&engine_numeraire, token);
         let path_t_to_n_nodes_opt = self.pathfinder.best_path(token, &engine_numeraire);
 
@@ -583,26 +603,89 @@ impl PriceEngine {
         let path_n_to_t_nodes = path_n_to_t_nodes_opt.unwrap();
         let path_t_to_n_nodes = path_t_to_n_nodes_opt.unwrap();
         
-        let graph_r = self.graph.read().unwrap();
-        let path_n_to_t_edges_opt = graph_r.derive_edges_for_node_path(&path_n_to_t_nodes);
-        let path_t_to_n_edges_opt = graph_r.derive_edges_for_node_path(&path_t_to_n_nodes);
+        // Introduce a new scope to ensure graph_r is dropped before .await
+        let (path_n_to_t_edges, path_t_to_n_edges) = {
+            let graph_r = self.graph.read().unwrap();
+            let path_n_to_t_edges_opt = graph_r.derive_edges_for_node_path(&path_n_to_t_nodes);
+            let path_t_to_n_edges_opt = graph_r.derive_edges_for_node_path(&path_t_to_n_nodes);
 
-        if path_n_to_t_edges_opt.is_none() || path_t_to_n_edges_opt.is_none() {
-            return None;
-        }
-        let path_n_to_t_edges = path_n_to_t_edges_opt.unwrap();
-        let path_t_to_n_edges = path_t_to_n_edges_opt.unwrap();
+            if path_n_to_t_edges_opt.is_none() || path_t_to_n_edges_opt.is_none() {
+                return None;
+            }
+            (path_n_to_t_edges_opt.unwrap(), path_t_to_n_edges_opt.unwrap())
+        }; // graph_r is dropped here
 
-        self.calculate_token_price_in_numeraire_impl( // Await the async call
-            token,              // target_token for the function signature
-            &engine_numeraire,  // numeraire_token for the function signature
-            probe_amount,       // probe_amount_of_numeraire
-            &path_n_to_t_nodes[..], 
-            &path_n_to_t_edges[..], 
-            &path_t_to_n_nodes[..], 
-            &path_t_to_n_edges[..], 
+        self.calculate_token_price_in_numeraire_impl(
+            token,              
+            &engine_numeraire,  
+            probe_amount,       
+            &path_n_to_t_nodes, // Pass as slice 
+            &path_n_to_t_edges, // Pass as slice
+            &path_t_to_n_nodes, // Pass as slice
+            &path_t_to_n_edges, // Pass as slice
             block,
-        ).await // Added await
+        ).await
+    }
+
+    async fn update_gas_price_from_infura(&self) -> Result<(), String> {
+        if let Some(key) = &self.infura_api_key {
+            let client = Client::new();
+            // TODO: Make this URL chain-aware if needed, based on self.chain or similar
+            let infura_url = format!("https://mainnet.infura.io/v3/{}", key);
+            
+            let rpc_payload = json!({
+                "jsonrpc": "2.0",
+                "method": "eth_gasPrice",
+                "params": [],
+                "id": 1
+            });
+
+            info!("Attempting to fetch gas price from Infura...");
+            match client.post(&infura_url).json(&rpc_payload).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.json::<Value>().await {
+                            Ok(json_response) => {
+                                if let Some(gas_price_hex) = json_response.get("result").and_then(|v| v.as_str()) {
+                                    let hex_val = gas_price_hex.trim_start_matches("0x");
+                                    match u128::from_str_radix(hex_val, 16) {
+                                        Ok(gas_price_val) => {
+                                            let mut gas_price_w = self.gas_price_wei.write().unwrap();
+                                            *gas_price_w = gas_price_val;
+                                            info!("Successfully updated gas price from Infura: {} wei", gas_price_val);
+                                            Ok(())
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to parse gas price hex from Infura: {}. Raw: '{}'", e, gas_price_hex);
+                                            Err(format!("Failed to parse gas price hex from Infura: {}. Raw: '{}'", e, gas_price_hex))
+                                        }
+                                    }
+                                } else {
+                                    warn!("Unexpected JSON structure from Infura: {:?}", json_response);
+                                    Err(format!("Unexpected JSON structure from Infura: {:?}", json_response))
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse JSON response from Infura: {}", e);
+                                Err(format!("Failed to parse JSON response from Infura: {}", e))
+                            },
+                        }
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+                        warn!("Infura request failed with status: {}. Body: {}", status, text);
+                        Err(format!("Infura request failed with status: {}. Body: {}", status, text))
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to send request to Infura: {}", e);
+                    Err(format!("Failed to send request to Infura: {}", e))
+                },
+            }
+        } else {
+            info!("No Infura API key configured. Skipping dynamic gas price update.");
+            Ok(()) 
+        }
     }
 
      // Other methods like precompute_all_quotes, log_all_paths, list_unit_price_vs_eth, etc.
