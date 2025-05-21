@@ -350,7 +350,7 @@ impl PriceEngine {
         let route_addresses: Vec<Bytes>;
         let pool_ids_for_path: Vec<String>;
         let mut total_protocol_fee_bps = Decimal::ZERO;
-        // let path_protocol_fees_bps: Vec<(String, Decimal)> = Vec::new(); // This can be computed inside the scope too
+        let mut compounded_fee_factor = Decimal::ONE;
 
         {
             let graph_r = self.graph.read().unwrap();
@@ -366,15 +366,15 @@ impl PriceEngine {
             pool_ids_for_path = edge_seq.iter().map(|e_idx| graph_r.graph.edge_weight(*e_idx).expect("Edge weight not found").pool_id.clone()).collect();
 
             for edge_idx in edge_seq.iter() {
-                if let Some(pool_edge) = graph_r.graph.edge_weight(*edge_idx) { 
-                    let fee_percent = pool_edge.fee; 
-                    let fee_decimal_factor = Decimal::from_f64_retain(fee_percent.unwrap_or(0.0)).unwrap_or_default();
-                    let fee_bps_for_edge = fee_decimal_factor * Decimal::new(10000, 0);
-                    total_protocol_fee_bps += fee_bps_for_edge;
-                    // path_protocol_fees_bps.push((pool_edge.pool_id.clone(), fee_bps_for_edge)); // If needed outside
+                if let Some(pool_edge) = graph_r.graph.edge_weight(*edge_idx) {
+                    let fee_percent = pool_edge.fee.unwrap_or(0.0);
+                    let fee_decimal = Decimal::from_f64_retain(fee_percent).unwrap_or_default();
+                    compounded_fee_factor *= Decimal::ONE - fee_decimal;
                 }
             }
-            // graph_r is dropped here
+            // Effective total protocol fee = 1 - compounded_fee_factor
+            let effective_protocol_fee = Decimal::ONE - compounded_fee_factor;
+            total_protocol_fee_bps = effective_protocol_fee * Decimal::new(10000, 0);
         }
         
         let current_block_num = block.unwrap_or(0);
@@ -434,23 +434,35 @@ impl PriceEngine {
             Decimal::ZERO
         };
 
-        let net_amount_out_dec = (gross_amount_out_dec - protocol_fee_amount_dec - gas_cost_in_token_out_decimal).max(Decimal::ZERO);
-        
-        // Convert the final net_amount_out_dec (which is correctly scaled to token_out_decimals)
-        // back to a u128 integer representing the smallest unit of the token.
-        // The mantissa gives the integer value if the decimal point were removed.
-        let net_amount_out = if net_amount_out_dec.is_zero() {
-            0u128
-        } else {
-            // Ensure the scale of net_amount_out_dec is indeed token_out_decimals before taking mantissa
-            // This should already be true due to prior calculations.
-            // If net_amount_out_dec was 123.45 (USDC, 6 decimals), its mantissa would be 123450000.
-            net_amount_out_dec.mantissa().abs().to_u128().unwrap_or(0)
+        // Make sure all Decimal values we will combine share the **same scale** (token_out_decimals)
+        let protocol_fee_amount_dec = {
+            // clone then rescale so we do not mutate the original value accidentally
+            let mut tmp = protocol_fee_amount_dec;
+            tmp.rescale(token_out_decimals);
+            tmp
         };
+        let mut gas_cost_in_token_out_decimal = gas_cost_in_token_out_decimal; // make mutable for rescale
+        gas_cost_in_token_out_decimal.rescale(token_out_decimals);
 
-        // Also store gross in raw units if needed (already is)
+        // Now compute the net amount in Decimal form
+        let net_amount_out_dec = (gross_amount_out_dec - protocol_fee_amount_dec - gas_cost_in_token_out_decimal)
+            .max(Decimal::ZERO);
+
+        // ------------------------------------------------------------------
+        // Convert Decimal net amount back to raw smallest-unit integer (u128)
+        // ------------------------------------------------------------------
+        // Multiply by 10^token_out_decimals and round to get the integer amount in base units.
+        let scaling_factor: Decimal = Decimal::from(10u64.pow(token_out_decimals));
+        let net_amount_raw_dec = (net_amount_out_dec * scaling_factor).round();
+        let net_amount_out = net_amount_raw_dec.to_u128().unwrap_or(0);
+
+        // Similarly, store the protocol fee in raw units so that downstream display logic can work reliably
+        let protocol_fee_raw_dec = (protocol_fee_amount_dec * scaling_factor).round();
+        let protocol_fee_raw_u128 = protocol_fee_raw_dec.to_u128().unwrap_or(0);
+
         // ------------------------------------------------------------------
         // Re-compute mid prices/slippage with correctly scaled Decimals
+        // ------------------------------------------------------------------
         let mid_price_approx_gross = if !amount_in_dec.is_zero() && !gross_amount_out_dec.is_zero() {
             Some(gross_amount_out_dec / amount_in_dec)
         } else {
@@ -474,7 +486,7 @@ impl PriceEngine {
             mid_price: mid_price_approx_net, 
             slippage_bps: slippage,
             fee_bps: fee_bps_for_quote, 
-            protocol_fee_in_token_out: Some(protocol_fee_amount_dec),
+            protocol_fee_in_token_out: Some(Decimal::from_i128_with_scale(protocol_fee_raw_u128 as i128, token_out_decimals)),
             gas_estimate: Some(gas_estimate_units),
             gross_amount_out: Some(gross_amount_out_val),
             spread_bps: spread,

@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock};
 // Use prelude for Decimal and common traits like FromPrimitive
 use rust_decimal::prelude::*;
 use env_logger;
+use std::time::Instant;
 
 // Helper to get token symbol and decimals
 // Returns (Symbol, Decimals)
@@ -43,6 +44,8 @@ fn format_route_symbols(tracker: &ComponentTracker, route_bytes: &[Bytes]) -> St
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Only show warnings and errors by default to reduce log output and speed up CLI
+    std::env::set_var("RUST_LOG", "warn");
     env_logger::init();
     // Load AppConfig using load_with_cli to respect CLI args, file, and env vars
     let config = AppConfig::load_with_cli(); 
@@ -99,6 +102,7 @@ async fn main() -> Result<()> {
 
 
     loop {
+        let block_start = Instant::now();
         match updates.next().await {
             Some(_block_update) => {
                 update_count += 1;
@@ -131,6 +135,9 @@ async fn main() -> Result<()> {
 
                 // Call the quote function
                 let quote: PriceQuote = engine.quote_multi(&sell_token_bytes, &buy_token_bytes, sell_amount_u128, 5, None).await;
+
+                // --- Print protocol fee percent for summary ---
+                let protocol_fee_percent = quote.fee_bps.map(|bps| (bps.to_f64().unwrap_or(0.0) / 100.0));
 
                 println!("\n--- Overall Best Quote Summary ---");
                 println!("Selling: {} {}", sell_amount_f64, sell_token_symbol);
@@ -171,7 +178,10 @@ async fn main() -> Result<()> {
                 
                 // Print other summary details if they exist
                 quote.slippage_bps.map(|val| println!("Slippage (bps): {}", val));
-                quote.fee_bps.map(|val| println!("Fee (bps): {}", val));
+                if let Some(fee_bps) = quote.fee_bps {
+                    let percent = fee_bps.to_f64().unwrap_or(0.0) / 100.0;
+                    println!("Fee (bps): {} ({:.3}%)", fee_bps, percent);
+                }
                 quote.gas_estimate.map(|val| println!("Gas Estimate: {}", val));
                 quote.spread_bps.map(|val| println!("Spread (bps): {}", val));
                 quote.price_impact_bps.map(|val| println!("Price Impact (bps): {}", val));
@@ -186,33 +196,34 @@ async fn main() -> Result<()> {
                 // Display details from the best path (first in path_details)
                 if let Some(best_path) = quote.path_details.first() {
                     if let Some(protocol_fee_val_raw_dec) = best_path.protocol_fee_in_token_out {
-                        // protocol_fee_val_raw_dec is a Decimal representing the raw amount in smallest units
-                        if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() { // Convert Decimal to u128 raw amount
-                           let formatted_protocol_fee = format_token_amount(protocol_fee_u128, buy_token_decimals);
-                           println!("Protocol Fee Amount: {} {}", formatted_protocol_fee, buy_token_symbol);
+                        let scaling_factor = Decimal::from(10u64.pow(buy_token_decimals as u32));
+                        let protocol_fee_raw_dec = (protocol_fee_val_raw_dec * scaling_factor).round();
+                        if let Some(protocol_fee_u128) = protocol_fee_raw_dec.to_u128() {
+                            let formatted_protocol_fee = format_token_amount(protocol_fee_u128, buy_token_decimals);
+                            let percent = best_path.fee_bps.map(|bps| bps.to_f64().unwrap_or(0.0) / 100.0).unwrap_or(0.0);
+                            println!("Protocol Fee Amount: {} {} ({:.3}%)", formatted_protocol_fee, buy_token_symbol, percent);
                         } else {
                             println!("Protocol Fee Amount: N/A (conversion error)");
                         }
                     }
                     if let Some(gas_native_val) = best_path.gas_cost_native {
-                        // Assuming gas_native_val is scaled correctly to native token's decimals
-                        // We'd need native token symbol and decimals to format it properly
-                        // For now, print as decimal
-                        println!("Gas Cost (Native): {}", gas_native_val.round_dp(8)); // Potentially add native symbol
+                        println!("Gas Cost (Native): {}", gas_native_val.round_dp(8));
                     }
                     if let Some(gas_token_out_val) = best_path.gas_cost_in_token_out {
                         println!("Gas Cost (Token Out): {} {}", gas_token_out_val.round_dp(6), buy_token_symbol);
                     }
-                } else if quote.amount_out.is_some() { // Handle single path case (k=1) where path_details might be empty but other fields are populated directly on PriceQuote
+                } else if quote.amount_out.is_some() {
                     if let Some(protocol_fee_val_raw_dec) = quote.protocol_fee_in_token_out {
-                         if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() {
+                         let scaling_factor = Decimal::from(10u64.pow(buy_token_decimals as u32));
+                         let protocol_fee_raw_dec = (protocol_fee_val_raw_dec * scaling_factor).round();
+                         if let Some(protocol_fee_u128) = protocol_fee_raw_dec.to_u128() {
                             let formatted_protocol_fee = format_token_amount(protocol_fee_u128, buy_token_decimals);
-                            println!("Protocol Fee Amount: {} {}", formatted_protocol_fee, buy_token_symbol);
+                            let percent = quote.fee_bps.map(|bps| bps.to_f64().unwrap_or(0.0) / 100.0).unwrap_or(0.0);
+                            println!("Protocol Fee Amount: {} {} ({:.3}%)", formatted_protocol_fee, buy_token_symbol, percent);
                          } else {
                             println!("Protocol Fee Amount: N/A (conversion error)");
                          }
                     }
-                    // Similar for gas_cost_native and gas_cost_in_token_out if they were fields of PriceQuote
                 }
 
                 quote.cache_block.map(|val| println!("Cache Block: {}", val));
@@ -236,6 +247,43 @@ async fn main() -> Result<()> {
                             (buy_token_symbol.clone(), buy_token_decimals) // Fallback
                         };
 
+                        // --- Per-hop breakdown ---
+                        if detail.route.len() > 1 && detail.pools.len() == detail.route.len() - 1 {
+                            println!("    Hop breakdown:");
+                            let avg_gas_per_swap = config.avg_gas_units_per_swap.unwrap_or(150_000);
+                            let mut compounded_fee_factor = 1.0f64;
+                            let graph_r = graph_arc.read().unwrap();
+                            for hop in 0..detail.pools.len() {
+                                let from_token = &detail.route[hop];
+                                let to_token = &detail.route[hop + 1];
+                                let pool_id = &detail.pools[hop];
+                                // Find node indices for from_token and to_token
+                                let from_idx = graph_r.token_indices.get(from_token);
+                                let to_idx = graph_r.token_indices.get(to_token);
+                                let mut pool_fee_percent = 0.0f64;
+                                if let (Some(&from_idx), Some(&to_idx)) = (from_idx, to_idx) {
+                                    // Find the edge for this hop
+                                    let edge = graph_r.graph.edges_connecting(from_idx, to_idx)
+                                        .find(|e| e.weight().pool_id == *pool_id);
+                                    if let Some(edge_ref) = edge {
+                                        pool_fee_percent = edge_ref.weight().fee.unwrap_or(0.0) * 100.0;
+                                    }
+                                }
+                                compounded_fee_factor *= 1.0 - (pool_fee_percent / 100.0);
+                                println!("      {} -> {} via {}: fee = {:.3}%, gas ≈ {}",
+                                    get_token_symbol_decimals(&tracker, from_token).0,
+                                    get_token_symbol_decimals(&tracker, to_token).0,
+                                    pool_id,
+                                    pool_fee_percent,
+                                    avg_gas_per_swap
+                                );
+                            }
+                            let effective_fee_percent = (1.0 - compounded_fee_factor) * 100.0;
+                            let total_gas = avg_gas_per_swap as usize * detail.pools.len();
+                            println!("      Total effective protocol fee: {:.3}%", effective_fee_percent);
+                            println!("      Total estimated gas: {}", total_gas);
+                        }
+
                         if let Some(input_raw) = detail.input_amount {
                             let formatted_input = format_token_amount(input_raw, path_input_decimals);
                             println!("    Input Amount (Path Sim): {} {}", formatted_input, path_input_symbol);
@@ -244,7 +292,6 @@ async fn main() -> Result<()> {
                                 let formatted_output = format_token_amount(output_raw, path_output_decimals);
                                 println!("    Net Amount Out (Path Sim): {} {}", formatted_output, path_output_symbol);
 
-                                // Calculate effective price for this path
                                 let input_dec = Decimal::from(input_raw) / Decimal::from(10u64.pow(path_input_decimals as u32));
                                 if !input_dec.is_zero() {
                                     let output_dec = Decimal::from(output_raw) / Decimal::from(10u64.pow(path_output_decimals as u32));
@@ -262,12 +309,17 @@ async fn main() -> Result<()> {
                             println!("    Gross Amount Out (Path Sim): {} {}", formatted_gross_output, path_output_symbol);
                         }
 
-                        // Display per-path fee and gas details
-                        detail.fee_bps.map(|val| println!("    Fee (bps, Path): {}", val));
+                        if let Some(fee_bps) = detail.fee_bps {
+                            let percent = fee_bps.to_f64().unwrap_or(0.0) / 100.0;
+                            println!("    Fee (bps, Path): {} ({:.3}%)", fee_bps, percent);
+                        }
                         if let Some(protocol_fee_val_raw_dec) = detail.protocol_fee_in_token_out {
-                            if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() {
+                            let scaling_factor = Decimal::from(10u64.pow(path_output_decimals as u32));
+                            let protocol_fee_raw_dec = (protocol_fee_val_raw_dec * scaling_factor).round();
+                            if let Some(protocol_fee_u128) = protocol_fee_raw_dec.to_u128() {
                                 let formatted_protocol_fee = format_token_amount(protocol_fee_u128, path_output_decimals);
-                                println!("    Protocol Fee Amount (Path): {} {}", formatted_protocol_fee, path_output_symbol);
+                                let percent = detail.fee_bps.map(|bps| bps.to_f64().unwrap_or(0.0) / 100.0).unwrap_or(0.0);
+                                println!("    Protocol Fee Amount (Path): {} {} ({:.3}%)", formatted_protocol_fee, path_output_symbol, percent);
                             } else {
                                 println!("    Protocol Fee Amount (Path): N/A (conversion error)");
                             }
@@ -281,9 +333,7 @@ async fn main() -> Result<()> {
                         }
 
                         if let Some(mid_price_path_raw) = detail.mid_price {
-                             // detail.mid_price is raw_buy_units / raw_sell_units for that specific simulation
-                             // To make it BUY_TOKEN per SELL_TOKEN: mid_price_raw * (10^sell_decimals) / (10^buy_decimals)
-                            let scaled_mid_price = mid_price_path_raw * Decimal::from(10u64.pow(path_input_decimals as u32)) / Decimal::from(10u64.pow(path_output_decimals as u32));
+                             let scaled_mid_price = mid_price_path_raw * Decimal::from(10u64.pow(path_input_decimals as u32)) / Decimal::from(10u64.pow(path_output_decimals as u32));
                             println!("    Mid Price (Path Sim): {} {} per {}", scaled_mid_price.round_dp(6), path_output_symbol, path_input_symbol);
                         }
                     }
@@ -292,11 +342,12 @@ async fn main() -> Result<()> {
                 if let Some(metrics) = &quote.depth_metrics {
                     println!("\n--- Depth Metrics ---");
                     for (slippage_target, depth_amount_raw) in metrics {
-                        // Assuming depth_amount is in terms of the sell_token for now
                         let formatted_depth = format_token_amount(*depth_amount_raw, sell_token_decimals);
                         println!("  Slippage {}: Amount {} {}", slippage_target, formatted_depth, sell_token_symbol);
                     }
                 }
+                let elapsed = block_start.elapsed().as_millis();
+                println!("Block calculation time: {} ms", elapsed);
             },
             None => {
                 println!("Tycho Indexer update stream ended or an error occurred. Exiting.");
