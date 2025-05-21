@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
                 
                 // Print other summary details if they exist
                 quote.slippage_bps.map(|val| println!("Slippage (bps): {}", val));
-                quote.fee_bps.map(|val| println!("Fee (bps): {}", val));
+                quote.fee_bps.map(|val| println!("Extra Fee (bps): {}", val));
                 quote.gas_estimate.map(|val| println!("Gas Estimate: {}", val));
                 quote.spread_bps.map(|val| println!("Spread (bps): {}", val));
                 quote.price_impact_bps.map(|val| println!("Price Impact (bps): {}", val));
@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
                         }
 
                         // Display per-path fee and gas details
-                        detail.fee_bps.map(|val| println!("    Fee (bps, Path): {}", val));
+                        detail.fee_bps.map(|val| println!("    Extra Fee (bps, Path): {}", val));
                         if let Some(protocol_fee_val_raw_dec) = detail.protocol_fee_in_token_out {
                             if let Some(protocol_fee_u128) = protocol_fee_val_raw_dec.to_u128() {
                                 let formatted_protocol_fee = format_token_amount(protocol_fee_u128, path_output_decimals);

@@ -34,6 +34,7 @@ const DEFAULT_ETH_ADDRESS_STR: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc
 const DEFAULT_PROBE_DEPTH: u128 = 1_000_000_000_000_000_000;
 const DEFAULT_AVG_GAS_UNITS_PER_SWAP: u64 = 150_000;
 const DEFAULT_NATIVE_DECIMALS: u32 = 18; // Changed to u32
+const SIMULATION_OUTPUT_ASSUMED_DECIMALS: u32 = 18;
 
 fn default_eth_address_bytes() -> Bytes {
     Bytes::from_str(DEFAULT_ETH_ADDRESS_STR).expect("Failed to parse default ETH address")
@@ -420,7 +421,12 @@ impl PriceEngine {
 
         // Convert integer (raw base-unit) amounts to Decimal **with the proper scale**
         let amount_in_dec   = Decimal::from_i128_with_scale(amount_in as i128,   token_in_decimals);
-        let gross_amount_out_dec = Decimal::from_i128_with_scale(gross_amount_out_val as i128, token_out_decimals);
+        // First, interpret sim output as a Decimal assuming it's scaled by SIMULATION_OUTPUT_ASSUMED_DECIMALS.
+        let gross_amount_out_sim_scaled_dec = Decimal::from_i128_with_scale(gross_amount_out_val as i128, SIMULATION_OUTPUT_ASSUMED_DECIMALS);
+        
+        // Then, explicitly rescale this Decimal to the actual token_out_decimals for further calculations.
+        let mut gross_amount_out_dec = gross_amount_out_sim_scaled_dec;
+        gross_amount_out_dec.rescale(token_out_decimals);
 
         // Ensure gas_cost_in_token_out_decimal is also expressed with the SAME scale as token_out_decimals
         gas_cost_in_token_out_decimal.rescale(token_out_decimals);
