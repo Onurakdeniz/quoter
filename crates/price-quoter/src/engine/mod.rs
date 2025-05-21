@@ -23,7 +23,7 @@ use petgraph::prelude::{NodeIndex, EdgeIndex};
 use petgraph::visit::EdgeRef;
 use std::str::FromStr;
 
-use rust_decimal::Decimal; // Ensure Decimal is imported if not already
+// Decimal is already imported above (around line 16)
 use futures::future::join_all; // For collecting async tasks
 use reqwest::Client; // Added for Infura calls
 use serde_json::{json, Value}; // Added for Infura calls
@@ -387,33 +387,32 @@ impl PriceEngine {
         let gross_amount_out_val: u128;
         let route_addresses: Vec<Bytes>;
         let pool_ids_for_path: Vec<String>;
-        let mut total_protocol_fee_bps = Decimal::ZERO;
-        let mut compounded_fee_factor = Decimal::ONE;
+        let compounded_fee_factor_final: Decimal;
 
         {
             let graph_r = self.graph.read().unwrap();
             let gross_opt = simulation::simulate_path_gross(&self.tracker, &graph_r, amount_in, &path, &edge_seq, block);
             if gross_opt.is_none() {
-                // To return early, we need to construct a SinglePathQuote. Since graph_r is available here,
-                // we can call invalid_path_quote which takes slices.
                 return quoting::invalid_path_quote(&path, &edge_seq, amount_in);
             }
             gross_amount_out_val = gross_opt.unwrap();
 
             route_addresses = path.iter().map(|idx| graph_r.graph.node_weight(*idx).expect("Node weight not found").address.clone()).collect();
             pool_ids_for_path = edge_seq.iter().map(|e_idx| graph_r.graph.edge_weight(*e_idx).expect("Edge weight not found").pool_id.clone()).collect();
-
+            
+            let mut current_compounded_factor = Decimal::ONE;
             for edge_idx in edge_seq.iter() {
                 if let Some(pool_edge) = graph_r.graph.edge_weight(*edge_idx) {
                     let fee_percent = pool_edge.fee.unwrap_or(0.0);
                     let fee_decimal = Decimal::from_f64_retain(fee_percent).unwrap_or_default();
-                    compounded_fee_factor *= Decimal::ONE - fee_decimal;
+                    current_compounded_factor *= Decimal::ONE - fee_decimal;
                 }
             }
-            // Effective total protocol fee = 1 - compounded_fee_factor
-            let effective_protocol_fee = Decimal::ONE - compounded_fee_factor;
-            total_protocol_fee_bps = effective_protocol_fee * Decimal::new(10000, 0);
-        }
+            compounded_fee_factor_final = current_compounded_factor;
+        } // Graph lock released
+        
+        let effective_protocol_fee = Decimal::ONE - compounded_fee_factor_final;
+        let total_protocol_fee_bps = effective_protocol_fee * Decimal::new(10000, 0);
         
         let current_block_num = block.unwrap_or(0);
         let gas_estimate_units = edge_seq.len() as u64 * self.avg_gas_units_per_swap;
