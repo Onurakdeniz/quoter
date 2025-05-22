@@ -7,6 +7,7 @@ use petgraph::visit::EdgeRef;
 use tycho_simulation::tycho_common::Bytes;
 use tracing::debug;
 use std::sync::{Arc, RwLock}; // Added imports
+use std::collections::HashSet; // Make sure HashSet is imported
 
 /// Main pathfinding struct, operates on TokenGraph.
 pub struct Pathfinder { // Removed lifetime 'a
@@ -241,6 +242,78 @@ impl Pathfinder { // Removed lifetime 'a
     }
 
     // TODO: Add slippage/fee/price-aware weights, parallel SSSP, incremental updates, etc.
+
+    /// Enumerate up to `k_split` non-overlapping paths by pool (edge) usage.
+    /// Paths are selected greedily, shortest first, from all simple paths up to `max_depth`.
+    pub fn enumerate_non_overlapping_paths_by_pool(
+        &self,
+        source: &Bytes,
+        target: &Bytes,
+        max_depth: usize,
+        k_split: usize, // Max number of non-overlapping paths to return
+    ) -> (Vec<Vec<NodeIndex>>, Vec<Vec<EdgeIndex>>) {
+        if k_split == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let all_node_paths = self.enumerate_paths(source, target, max_depth);
+        if all_node_paths.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let graph_r = self.graph.read().unwrap();
+        let mut paths_with_edges: Vec<(Vec<NodeIndex>, Vec<EdgeIndex>)> = Vec::new();
+
+        for node_path in all_node_paths {
+            if node_path.len() < 2 { // Need at least two nodes for an edge
+                continue;
+            }
+            match graph_r.derive_edges_for_node_path(&node_path) {
+                Some(edge_path) => {
+                    if !edge_path.is_empty() { // Ensure there are edges
+                        paths_with_edges.push((node_path, edge_path));
+                    }
+                }
+                None => {
+                    // This case should ideally not happen if enumerate_paths returns valid paths
+                    // and derive_edges_for_node_path is robust.
+                    // Log or handle as an error if necessary.
+                    debug!(path = ?node_path, "Could not derive edges for node path");
+                }
+            }
+        }
+
+        // Sort paths by the number of hops (length of node_path)
+        paths_with_edges.sort_by_key(|(np, _)| np.len());
+
+        let mut selected_node_paths: Vec<Vec<NodeIndex>> = Vec::new();
+        let mut selected_edge_paths: Vec<Vec<EdgeIndex>> = Vec::new();
+        let mut used_pools: HashSet<EdgeIndex> = HashSet::new();
+
+        for (node_path, edge_path) in paths_with_edges {
+            if selected_node_paths.len() >= k_split {
+                break;
+            }
+
+            let mut is_overlapping = false;
+            for edge_idx in &edge_path {
+                if used_pools.contains(edge_idx) {
+                    is_overlapping = true;
+                    break;
+                }
+            }
+
+            if !is_overlapping {
+                selected_node_paths.push(node_path);
+                for edge_idx in &edge_path {
+                    used_pools.insert(*edge_idx);
+                }
+                selected_edge_paths.push(edge_path);
+            }
+        }
+
+        (selected_node_paths, selected_edge_paths)
+    }
 }
 
 // New delta module implementing parallel Δ-Stepping SSSP

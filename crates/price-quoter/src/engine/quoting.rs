@@ -112,6 +112,10 @@ pub struct PriceQuote {
     pub depth_metrics: Option<HashMap<String, u128>>,
     /// If this quote was returned from the cache, which block it was cached at
     pub cache_block: Option<u64>,
+    /// Indicates if the quote was a result of splitting the trade across multiple paths
+    pub is_split_trade: bool,
+    /// Number of paths the trade was split across (1 if not split, 0 if no path)
+    pub num_split_paths: usize,
 }
 
 /// Per-path quote details for multi-path evaluation
