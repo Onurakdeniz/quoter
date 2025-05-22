@@ -456,8 +456,18 @@ impl PriceEngine {
             .unwrap_or(18u32);
 
         // Convert integer (raw base-unit) amounts to Decimal **with the proper scale**
-        let amount_in_dec   = Decimal::from_i128_with_scale(amount_in as i128,   token_in_decimals);
-        let gross_amount_out_dec = Decimal::from_i128_with_scale(gross_amount_out_val as i128, token_out_decimals);
+        let amount_in_dec = if amount_in <= i128::MAX as u128 && token_in_decimals <= 28 {
+            Decimal::from_i128_with_scale(amount_in as i128, token_in_decimals)
+        } else {
+            warn!("Overflow risk: amount_in={} token_in_decimals={}", amount_in, token_in_decimals);
+            Decimal::ZERO
+        };
+        let gross_amount_out_dec = if gross_amount_out_val <= i128::MAX as u128 && token_out_decimals <= 28 {
+            Decimal::from_i128_with_scale(gross_amount_out_val as i128, token_out_decimals)
+        } else {
+            warn!("Overflow risk: gross_amount_out_val={} token_out_decimals={}", gross_amount_out_val, token_out_decimals);
+            Decimal::ZERO
+        };
 
         // Ensure gas_cost_in_token_out_decimal is also expressed with the SAME scale as token_out_decimals
         gas_cost_in_token_out_decimal.rescale(token_out_decimals);
@@ -489,12 +499,42 @@ impl PriceEngine {
         // Convert Decimal net amount back to raw smallest-unit integer (u128)
         // ------------------------------------------------------------------
         // Multiply by 10^token_out_decimals and round to get the integer amount in base units.
-        let scaling_factor: Decimal = Decimal::from(10u64.pow(token_out_decimals));
-        let net_amount_raw_dec = (net_amount_out_dec * scaling_factor).round();
+        let scaling_factor_result = 10u64.checked_pow(token_out_decimals);
+        let scaling_factor: Decimal = match scaling_factor_result {
+            Some(val) => Decimal::from(val),
+            None => {
+                warn!("Overflow in scaling_factor calculation for token_out_decimals: {}", token_out_decimals);
+                Decimal::ZERO
+            }
+        };
+        // Check for overflow before multiplication
+        let net_amount_raw_dec = if net_amount_out_dec.abs().to_i128().unwrap_or(0).abs() <= i128::MAX / scaling_factor.to_i128().unwrap_or(1).abs() {
+            match net_amount_out_dec.checked_mul(scaling_factor) {
+                Some(val) => val.round(),
+                None => {
+                    warn!("Overflow in net_amount_out_dec * scaling_factor");
+                    Decimal::ZERO
+                }
+            }
+        } else {
+            warn!("Overflow risk: net_amount_out_dec * scaling_factor");
+            Decimal::ZERO
+        };
         let net_amount_out = net_amount_raw_dec.to_u128().unwrap_or(0);
 
         // Similarly, store the protocol fee in raw units so that downstream display logic can work reliably
-        let protocol_fee_raw_dec = (protocol_fee_amount_dec * scaling_factor).round();
+        let protocol_fee_raw_dec = if protocol_fee_amount_dec.abs().to_i128().unwrap_or(0).abs() <= i128::MAX / scaling_factor.to_i128().unwrap_or(1).abs() {
+            match protocol_fee_amount_dec.checked_mul(scaling_factor) {
+                Some(val) => val.round(),
+                None => {
+                    warn!("Overflow in protocol_fee_amount_dec * scaling_factor");
+                    Decimal::ZERO
+                }
+            }
+        } else {
+            warn!("Overflow risk: protocol_fee_amount_dec * scaling_factor");
+            Decimal::ZERO
+        };
         let protocol_fee_raw_u128 = protocol_fee_raw_dec.to_u128().unwrap_or(0);
 
         // ------------------------------------------------------------------
