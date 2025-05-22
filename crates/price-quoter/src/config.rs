@@ -31,6 +31,7 @@ pub struct AppConfig {
     pub display_numeraire_token_address: Option<String>,
     pub price_history_file: Option<String>,
     pub protocol_fee_bps: Option<f64>,
+    pub max_split_paths: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,7 @@ pub struct FileConfig {
     pub sell_amount_value: Option<f64>,
     pub display_numeraire_token_address: Option<String>,
     pub protocol_fee_bps: Option<f64>,
+    pub max_split_paths: Option<usize>,
 }
 
 #[cfg(feature = "cli")]
@@ -99,6 +101,8 @@ pub struct CliConfig {
     pub price_history_file: Option<String>,
     #[arg(long)]
     pub protocol_fee_bps: Option<f64>,
+    #[arg(long)]
+    pub max_split_paths: Option<usize>,
 }
 
 impl AppConfig {
@@ -130,6 +134,7 @@ impl AppConfig {
         let native_token_address = env::var("NATIVE_TOKEN_ADDRESS").ok().and_then(|s| Bytes::from_str(&s).ok());
         let infura_api_key = env::var("INFURA_API_KEY").ok();
         let protocol_fee_bps = env::var("PROTOCOL_FEE_BPS").ok().and_then(|s| s.parse().ok());
+        let max_split_paths = env::var("MAX_SPLIT_PATHS").ok().and_then(|s| s.parse().ok());
 
         Self {
             tycho_url,
@@ -151,6 +156,7 @@ impl AppConfig {
             display_numeraire_token_address: None,
             price_history_file: env::var("PRICE_HISTORY_FILE").ok(),
             protocol_fee_bps,
+            max_split_paths,
         }
     }
 
@@ -176,6 +182,7 @@ impl AppConfig {
             display_numeraire_token_address: None,
             native_token_address: None,
             protocol_fee_bps: None,
+            max_split_paths: None,
         };
         if let Some(ref path) = cli.config {
             if let Ok(contents) = std::fs::read_to_string(path) {
@@ -254,6 +261,9 @@ impl AppConfig {
         let protocol_fee_bps = cli.protocol_fee_bps
             .or(file_config.protocol_fee_bps)
             .or(env::var("PROTOCOL_FEE_BPS").ok().and_then(|s| s.parse().ok()));
+        let max_split_paths = cli.max_split_paths
+            .or(file_config.max_split_paths)
+            .or(env::var("MAX_SPLIT_PATHS").ok().and_then(|s| s.parse().ok()));
 
         Self {
             tycho_url,
@@ -275,6 +285,7 @@ impl AppConfig {
             display_numeraire_token_address,
             price_history_file,
             protocol_fee_bps,
+            max_split_paths,
         }
     }
 
@@ -293,6 +304,7 @@ impl AppConfig {
         tvl_threshold: Option<f64>,
         infura_api_key: Option<String>,
         protocol_fee_bps: Option<f64>,
+        max_split_paths: Option<usize>,
         // tokens_file and price_history_file are omitted for Python bindings for now
         // as they are less likely to be configured this way.
     ) -> Result<Self, String> {
@@ -329,6 +341,7 @@ impl AppConfig {
             display_numeraire_token_address: None, // Not relevant for general quoter init
             price_history_file: None, // Not configured via Python for now
             protocol_fee_bps,
+            max_split_paths,
         })
     }
 }

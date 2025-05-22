@@ -65,6 +65,7 @@ pub struct PriceEngine {
     pub native_token_address: Bytes, // Added
     pub avg_gas_units_per_swap: u64, // Added, no longer Option
     pub infura_api_key: Option<String>, // Added Infura API Key
+    pub max_split_paths: usize,
 }
 
 impl PriceEngine {
@@ -85,6 +86,7 @@ impl PriceEngine {
             native_token_address: default_eth_address_bytes(), // Default native token
             avg_gas_units_per_swap: DEFAULT_AVG_GAS_UNITS_PER_SWAP, // Default gas units
             infura_api_key: None, // Initialize as None
+            max_split_paths: 1, // Default to 1, will be updated from config
         }
     }
 
@@ -105,6 +107,7 @@ impl PriceEngine {
             native_token_address: default_eth_address_bytes(), // Default native token
             avg_gas_units_per_swap: DEFAULT_AVG_GAS_UNITS_PER_SWAP, // Default gas units
             infura_api_key: None, // Initialize as None
+            max_split_paths: 1, // Default to 1, will be updated from config
         }
     }
     
@@ -121,6 +124,7 @@ impl PriceEngine {
         let native_token_address = config.native_token_address.clone().unwrap_or_else(default_eth_address_bytes);
         let avg_gas_units_per_swap = config.avg_gas_units_per_swap.unwrap_or(DEFAULT_AVG_GAS_UNITS_PER_SWAP);
         let infura_api_key = config.infura_api_key.clone(); // Get Infura API key from config
+        let max_split_paths = config.max_split_paths.unwrap_or(1); // Default to 1 if not in config
 
         Self {
             tracker,
@@ -134,6 +138,7 @@ impl PriceEngine {
             native_token_address,
             avg_gas_units_per_swap,
             infura_api_key, // Store Infura API key
+            max_split_paths,
         }
     }
 
@@ -283,23 +288,160 @@ impl PriceEngine {
         // Sort by net amount_out descending
         let mut sorted_paths = evaluated_paths_results; // Use the collected results
         sorted_paths.sort_by(|a, b| b.amount_out.cmp(&a.amount_out));
-        sorted_paths.truncate(k);
+        // sorted_paths.truncate(k); // Truncate after selecting split paths, not before.
 
         if sorted_paths.is_empty() {
             return PriceQuote { amount_out: None, route: vec![], price_impact_bps: None, mid_price: None, slippage_bps: None, fee_bps: None, protocol_fee_in_token_out: None, gas_estimate: None, path_details: vec![], gross_amount_out: None, spread_bps: None, depth_metrics: None, cache_block: None };
         }
 
-        let best_path_details = sorted_paths[0].clone();
+        // Logic for selecting non-overlapping paths for splitting
+        let mut selected_split_paths: Vec<SinglePathQuote> = Vec::new();
+        let mut used_edges: HashSet<EdgeIndex> = HashSet::new();
+
+        for path_quote in sorted_paths.iter() {
+            if selected_split_paths.len() >= self.max_split_paths {
+                break;
+            }
+            // Ensure path_quote.edge_seq is not empty and path_quote.amount_out is Some
+            if path_quote.edge_seq.is_empty() || path_quote.amount_out.is_none() {
+                continue;
+            }
+            let current_path_edges: HashSet<EdgeIndex> = path_quote.edge_seq.iter().cloned().collect();
+            if used_edges.is_disjoint(&current_path_edges) {
+                selected_split_paths.push(path_quote.clone());
+                used_edges.extend(current_path_edges);
+            }
+        }
+
+        // If no paths could be selected (e.g. all overlap and max_split_paths > 0, or sorted_paths was empty initially)
+        // or if splitting is not beneficial/configured, fallback to the single best path from the initial full amount simulation.
+        if selected_split_paths.is_empty() && !sorted_paths.is_empty() {
+            selected_split_paths.push(sorted_paths[0].clone());
+        } else if selected_split_paths.is_empty() {
+             // This case means sorted_paths was also empty, handled by the check above.
+            return PriceQuote { amount_out: None, route: vec![], price_impact_bps: None, mid_price: None, slippage_bps: None, fee_bps: None, protocol_fee_in_token_out: None, gas_estimate: None, path_details: vec![], gross_amount_out: None, spread_bps: None, depth_metrics: None, cache_block: None };
+        }
+
+
+        let final_path_details: Vec<SinglePathQuote>;
+        let final_amount_out: Option<u128>;
+        let final_gross_amount_out: Option<u128>;
+        let final_gas_estimate: Option<u64>;
+        let final_protocol_fee_in_token_out: Option<Decimal>;
+        let final_route: Vec<Bytes>;
+        let final_price_impact_bps: Option<Decimal>;
+        let final_slippage_bps: Option<Decimal>;
+        let final_fee_bps: Option<Decimal>;
+
+        if selected_split_paths.len() <= 1 || self.max_split_paths <= 1 {
+            // Use the single best path (selected_split_paths will have one item, or sorted_paths[0] if selection failed but sorted_paths wasn't empty)
+            let best_path_details = selected_split_paths[0].clone();
+            final_path_details = vec![best_path_details.clone()];
+            final_amount_out = best_path_details.amount_out;
+            final_gross_amount_out = best_path_details.gross_amount_out;
+            final_gas_estimate = best_path_details.gas_estimate;
+            final_protocol_fee_in_token_out = best_path_details.protocol_fee_in_token_out;
+            final_route = best_path_details.route.clone();
+            final_price_impact_bps = best_path_details.price_impact_bps;
+            final_slippage_bps = best_path_details.slippage_bps;
+            final_fee_bps = best_path_details.fee_bps;
+        } else {
+            // Splitting logic
+            let num_splits = selected_split_paths.len();
+            if num_splits == 0 { // Should not happen due to logic above, but as a safeguard
+                return PriceQuote { amount_out: None, route: vec![], price_impact_bps: None, mid_price: None, slippage_bps: None, fee_bps: None, protocol_fee_in_token_out: None, gas_estimate: None, path_details: vec![], gross_amount_out: None, spread_bps: None, depth_metrics: None, cache_block: None };
+            }
+            let split_amount_in = amount_in / (num_splits as u128);
+
+            if split_amount_in == 0 { // Amount too small to split, revert to single best path logic
+                let best_path_details = sorted_paths[0].clone(); // Fallback to the overall best path
+                final_path_details = vec![best_path_details.clone()];
+                final_amount_out = best_path_details.amount_out;
+                final_gross_amount_out = best_path_details.gross_amount_out;
+                final_gas_estimate = best_path_details.gas_estimate;
+                final_protocol_fee_in_token_out = best_path_details.protocol_fee_in_token_out;
+                final_route = best_path_details.route.clone();
+                final_price_impact_bps = best_path_details.price_impact_bps;
+                final_slippage_bps = best_path_details.slippage_bps;
+                final_fee_bps = best_path_details.fee_bps;
+            } else {
+                let mut split_path_results_futures = Vec::new();
+                for path_to_resimulate in selected_split_paths.iter() {
+                    let future = self.quote_single_path_with_edges(
+                        token_in.clone(),
+                        token_out.clone(),
+                        split_amount_in,
+                        path_to_resimulate.node_path.clone(),
+                        path_to_resimulate.edge_seq.clone(),
+                        Some(current_block),
+                    );
+                    split_path_results_futures.push(future);
+                }
+                let split_path_results: Vec<SinglePathQuote> = join_all(split_path_results_futures).await
+                    .into_iter()
+                    .filter(|pq| pq.amount_out.is_some() && pq.amount_out.unwrap_or(0) > 0) // Filter out failures or zero outs
+                    .collect();
+
+                if split_path_results.is_empty() { // All split simulations failed, fallback to single best path
+                    let best_path_details = sorted_paths[0].clone();
+                    final_path_details = vec![best_path_details.clone()];
+                    final_amount_out = best_path_details.amount_out;
+                    final_gross_amount_out = best_path_details.gross_amount_out;
+                    final_gas_estimate = best_path_details.gas_estimate;
+                    final_protocol_fee_in_token_out = best_path_details.protocol_fee_in_token_out;
+                    final_route = best_path_details.route.clone();
+                    final_price_impact_bps = best_path_details.price_impact_bps;
+                    final_slippage_bps = best_path_details.slippage_bps;
+                    final_fee_bps = best_path_details.fee_bps;
+                } else {
+                    final_path_details = split_path_results.clone();
+                    final_amount_out = Some(split_path_results.iter().map(|p| p.amount_out.unwrap_or(0)).sum());
+                    final_gross_amount_out = Some(split_path_results.iter().map(|p| p.gross_amount_out.unwrap_or(0)).sum());
+                    final_gas_estimate = Some(split_path_results.iter().map(|p| p.gas_estimate.unwrap_or(0)).sum());
+                    
+                    let total_protocol_fee_in_token_out_dec: Decimal = split_path_results.iter()
+                        .filter_map(|p| p.protocol_fee_in_token_out)
+                        .fold(Decimal::ZERO, |acc, fee| acc + fee);
+                    final_protocol_fee_in_token_out = if total_protocol_fee_in_token_out_dec.is_zero() { None } else { Some(total_protocol_fee_in_token_out_dec) };
+
+                    final_route = split_path_results.get(0).map_or(vec![], |p| p.route.clone()); // Route of the first split path
+
+                    // Aggregate BPS values (complex, using best single path's values as approximation for now)
+                    // Fallback to the best path from the initial full simulation for these metrics
+                    let best_overall_path_for_metrics = sorted_paths[0].clone();
+                    final_price_impact_bps = best_overall_path_for_metrics.price_impact_bps;
+                    final_slippage_bps = best_overall_path_for_metrics.slippage_bps;
+                    
+                    // Calculate combined fee_bps
+                    if let (Some(total_gross_out_val), Some(total_fee_val_dec)) = (final_gross_amount_out, final_protocol_fee_in_token_out) {
+                        if total_gross_out_val > 0 {
+                             let token_out_decimals = self.tracker.all_tokens.read().unwrap()
+                                .get(token_out)
+                                .map(|t| t.decimals as u32)
+                                .unwrap_or(18u32);
+                            let total_gross_out_dec = Decimal::from_i128_with_scale(total_gross_out_val as i128, token_out_decimals);
+                            if !total_gross_out_dec.is_zero() {
+                                final_fee_bps = Some((total_fee_val_dec / total_gross_out_dec) * Decimal::new(10000, 0));
+                            } else {
+                                final_fee_bps = None;
+                            }
+                        } else {
+                            final_fee_bps = None;
+                        }
+                    } else {
+                        final_fee_bps = None;
+                    }
+                }
+            }
+        }
         
-        // Calculate mid_price and spread_bps based on two-way price details
+        // Calculate mid_price and spread_bps based on two-way price details (remains the same)
         let engine_numeraire_address = self.numeraire_token.clone().unwrap_or_else(default_eth_address_bytes);
         let mut mid_price_of_token_in_vs_token_out = None;
         let mut quote_spread_bps: Option<Decimal> = None;
 
         if *token_in == *token_out {
             mid_price_of_token_in_vs_token_out = Some(Decimal::ONE);
-            // Spread is arguably 0 if tokens are the same, or None if not meaningful.
-            // For now, let's assume if token_out is numeraire, it's 0.
             if *token_out == engine_numeraire_address {
                  quote_spread_bps = Some(Decimal::ZERO);
             }
@@ -312,34 +454,28 @@ impl PriceEngine {
                 if !details_out.mean_price.is_zero() {
                     mid_price_of_token_in_vs_token_out = Some(details_in.mean_price / details_out.mean_price);
                 }
-
-                // Calculate spread_bps for PriceQuote if token_out is the engine's numeraire
-                // This uses the two-way price details of token_in vs the numeraire.
                 if *token_out == engine_numeraire_address {
                     quote_spread_bps = analytics::calculate_spread_bps_from_two_way_prices(
                         details_in.price_forward,
                         details_in.price_backward_normalized,
                         details_in.mean_price,
                     );
-                }
-                // If token_in is numeraire and token_out is something else, calculate spread for token_out vs numeraire.
-                // This is for cases like ETH -> TokenX, where spread of TokenX is of interest.
-                else if *token_in == engine_numeraire_address {
+                } else if *token_in == engine_numeraire_address {
                      quote_spread_bps = analytics::calculate_spread_bps_from_two_way_prices(
                         details_out.price_forward,
                         details_out.price_backward_normalized,
                         details_out.mean_price,
                     );
                 }
-                // Otherwise, quote_spread_bps remains None, as per current simplified logic.
             }
         }
         
         let mut depth_metrics_map = HashMap::new();
-
-        // Calculate depth metrics for the best path if numeraire is set
-        if self.numeraire_token.is_some() && self.probe_depth.is_some() {
+        // Calculate depth metrics using the first path from the final_path_details for consistency,
+        // especially if splitting occurred.
+        if self.numeraire_token.is_some() && self.probe_depth.is_some() && !final_path_details.is_empty() {
              if let Some(mid_price_val) = mid_price_of_token_in_vs_token_out {
+                let path_for_depth_calc = &final_path_details[0]; // Use the best path (or first split path)
                 for slippage_target_str in ["0.1%", "0.5%", "1.0%", "2.0%", "5.0%"] {
                     let slippage_target_f64 = slippage_target_str.trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
                     if let Some(depth_amount) = analytics::find_depth_for_slippage(
@@ -348,8 +484,8 @@ impl PriceEngine {
                         token_in, 
                         token_out, 
                         mid_price_val, 
-                        &best_path_details.node_path, 
-                        &best_path_details.edge_seq, 
+                        &path_for_depth_calc.node_path, 
+                        &path_for_depth_calc.edge_seq, 
                         slippage_target_f64, 
                         Some(current_block)
                     ) {
@@ -360,17 +496,17 @@ impl PriceEngine {
         }
         
         PriceQuote {
-            amount_out: best_path_details.amount_out,
-            route: best_path_details.route.clone(),
-            price_impact_bps: best_path_details.price_impact_bps, // From SinglePathQuote
-            mid_price: mid_price_of_token_in_vs_token_out, // Calculated above
-            slippage_bps: best_path_details.slippage_bps, // From SinglePathQuote
-            fee_bps: best_path_details.fee_bps, // From SinglePathQuote
-            protocol_fee_in_token_out: best_path_details.protocol_fee_in_token_out, // From SinglePathQuote
-            gas_estimate: best_path_details.gas_estimate, // From SinglePathQuote
-            path_details: sorted_paths, // Vec<SinglePathQuote>
-            gross_amount_out: best_path_details.gross_amount_out, // From SinglePathQuote
-            spread_bps: quote_spread_bps, // Calculated for PriceQuote based on numeraire relationship
+            amount_out: final_amount_out,
+            route: final_route,
+            price_impact_bps: final_price_impact_bps,
+            mid_price: mid_price_of_token_in_vs_token_out,
+            slippage_bps: final_slippage_bps,
+            fee_bps: final_fee_bps,
+            protocol_fee_in_token_out: final_protocol_fee_in_token_out,
+            gas_estimate: final_gas_estimate,
+            path_details: final_path_details, // This now contains either the single best path or the split paths
+            gross_amount_out: final_gross_amount_out,
+            spread_bps: quote_spread_bps,
             depth_metrics: if depth_metrics_map.is_empty() { None } else { Some(depth_metrics_map) },
             cache_block: None, // This is a fresh quote
         }
