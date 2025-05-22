@@ -11,8 +11,8 @@ use std::io::BufRead; // Added back for reader.lines()
 
 // Constants for gas calculation
 const GWEI_TO_NATIVE_CONVERSION_FACTOR: f64 = 1e-9; // 1 Gwei = 10^-9 Native Token (e.g., ETH)
-// TODO: This should ideally come from config or be chain-specific
-const NATIVE_TOKEN_DECIMALS: u32 = 18;
+// TODO: NATIVE_TOKEN_DECIMALS was unused and removed. Native token decimal information
+// should be sourced dynamically, likely from ComponentTracker or AppConfig.
 // Placeholder for native token address (e.g., WETH on Ethereum)
 // TODO: This should be dynamically configurable based on the chain.
 

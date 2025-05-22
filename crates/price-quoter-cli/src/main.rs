@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
                 let quote: PriceQuote = engine.quote_multi(&sell_token_bytes, &buy_token_bytes, sell_amount_u128, 5, None).await;
 
                 // --- Print protocol fee percent for summary ---
-                let protocol_fee_percent = quote.fee_bps.map(|bps| (bps.to_f64().unwrap_or(0.0) / 100.0));
+                let _protocol_fee_percent = quote.fee_bps.map(|bps| (bps.to_f64().unwrap_or(0.0) / 100.0));
 
                 println!("\n--- Overall Best Quote Summary ---");
                 println!("Selling: {} {}", sell_amount_f64, sell_token_symbol);

@@ -118,7 +118,7 @@ impl From<RustPriceQuote> for PyPriceQuote {
 #[pyclass(name = "PriceQuoter")]
 struct PyPriceQuoter {
     engine: Arc<PriceEngine>,
-    runtime: Arc<tokio::runtime::Runtime>, 
+    // runtime: Arc<tokio::runtime::Runtime>, // Removed as it's only used in new()
 }
 
 #[pymethods]
@@ -199,7 +199,7 @@ impl PyPriceQuoter {
 
         Ok(PyPriceQuoter { 
             engine: engine_arc,
-            runtime: Arc::new(rt), // Store runtime
+            // runtime: Arc::new(rt), // No longer storing runtime
         })
     }
 
